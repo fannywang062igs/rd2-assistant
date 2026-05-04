@@ -12,7 +12,7 @@ service cloud.firestore {
     }
 
     function isAdmin() {
-      return isSignedIn() && request.auth.token.email == 'fannywang062igs@gmail.com' && request.auth.token.email_verified == true;
+      return isSignedIn() && request.auth.token.email == 'fannywang062igs@gmail.com';
     }
 
     function isValidId(id) {

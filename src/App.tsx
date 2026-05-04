@@ -114,10 +114,25 @@ const DebouncedInput = ({ value, onChange, className, style, ...props }: any) =>
 
 const handleFirestoreError = (error: any, operation: string) => {
   console.error(`Firestore Error [${operation}]:`, error);
-  if (error.message?.includes('exceeds the maximum allowed size')) {
-    alert('圖片太大了！我們已嘗試壓縮，但這張照片仍超過限制，請嘗試更小的照片或先自行選取較小尺寸。');
+  const msg = error.message || '';
+  
+  if (msg.includes('exceeds the maximum allowed size') || msg.includes('too large')) {
+    alert('【儲存失敗：資料量超標】\n您的設定內容太大（超過 1MB）。請更換較小的圖片或減少文字內容。');
+  } else if (msg.includes('resource-exhausted') || msg.includes('Quota exceeded')) {
+    alert('【系統配額已達上限】\n今日資料庫的寫入次數已達 Firebase 免費额度上限。請：\n1. 等待明日配額重置 (台灣時間約下午 3~4 點)。\n2. 暫時不要頻繁點擊儲存。');
+  } else if (msg.includes('insufficient permissions')) {
+    alert('【操作失敗：權限不足】\n請確認：\n1. 您是否已登入正確的 Admin 帳號。\n2. 您的 Email 是否已通過驗證。\n3. 建議重新整理頁面再試。');
   } else {
-    alert(`操作失敗: ${error.message || '未知錯誤'}`);
+    alert(`操作失敗 [${operation}]: ${msg || '未知錯誤'}`);
+  }
+};
+
+const getObjectSize = (obj: any) => {
+  try {
+    const str = JSON.stringify(obj);
+    return str.length; // 回傳字串長度作為估算
+  } catch (e) {
+    return 0;
   }
 };
 
@@ -139,8 +154,8 @@ const compressImage = (base64Str: string, maxWidth = 800): Promise<string> => {
       canvas.height = height;
       const ctx = canvas.getContext('2d');
       ctx?.drawImage(img, 0, 0, width, height);
-      // 使用 jpeg 格式並將品質設定為 0.5 確保不會超過 1MB 限制
-      resolve(canvas.toDataURL('image/jpeg', 0.5));
+      // 使用 jpeg 格式並將品質設定為 0.4 進一步減少體積
+      resolve(canvas.toDataURL('image/jpeg', 0.4));
     };
   });
 };
@@ -186,13 +201,34 @@ const IconPicker = ({ currentIcon, onChange, size = 18 }: { currentIcon: string,
 
 const App = () => {
   // --- States ---
-  const [dbData, setDbData] = useState([]); // Renamed 'db' to 'dbData' to avoid conflict with firebase 'db'
+  const [groups, setGroups] = useState<any[]>([]);
+  const [items, setItems] = useState<any[]>([]);
+  const [sections, setSections] = useState<any[]>([]);
+  
   const [user, setUser] = useState(null);
+
+  const dbData = useMemo(() => {
+    return groups.map(g => ({
+      ...g,
+      items: items.filter(i => i.groupId === g.id).map(i => ({
+        ...i,
+        content: sections.filter(s => s.itemId === i.id)
+      }))
+    }));
+  }, [groups, items, sections]);
 
   const touchItem = async (gIdx, iIdx) => {
     try {
-      const item = dbData[gIdx]?.items?.[iIdx];
+      const groupData = dbData[gIdx];
+      const item = groupData?.items?.[iIdx];
       if (!item) return;
+
+      // 檢查是否最近已經更新過 (1分鐘內)，避免頻繁寫入
+      if (item.updatedAt && (Date.now() - item.updatedAt < 60000)) {
+        return;
+      }
+
+      console.log(`[Firestore Write] touchItem: ${item.id} (last update: ${item.updatedAt})`);
       const itemRef = doc(db, 'items', item.id);
       await updateDoc(itemRef, { updatedAt: Date.now() });
     } catch (error) {
@@ -250,14 +286,13 @@ const App = () => {
 
   useEffect(() => {
     if (!isAuthReady) return;
+    
     const unsubscribeConfig = onSnapshot(doc(db, 'config', 'general'), (snap) => {
-      // Don't overwrite local state if we're currently editing
       if (snap.exists() && !isEditMode) {
         const data = snap.data();
         if (data.headerTitle) setHeaderTitle(data.headerTitle);
         if (data.headerSubtitle) setHeaderSubtitle(data.headerSubtitle);
         if (data.headerDescription) setHeaderDescription(data.headerDescription);
-        if (data.homeBlocks) setHomeBlocks(data.homeBlocks);
         if (data.footerTaxLabel) setFooterTaxLabel(data.footerTaxLabel);
         if (data.footerTaxId) setFooterTaxId(data.footerTaxId);
         if (data.footerCopyright) setFooterCopyright(data.footerCopyright);
@@ -269,57 +304,59 @@ const App = () => {
         if (data.contentFontSize) setContentFontSize(data.contentFontSize);
         if (data.linkFontSize) setLinkFontSize(data.linkFontSize);
       }
-    });
-    return () => unsubscribeConfig();
+    }, (error) => handleFirestoreError(error, 'onSnapshot-config-general'));
+    
+    // 分離監聽首頁區塊，分散資料量壓力
+    const unsubscribeHome = onSnapshot(doc(db, 'config', 'home'), (snap) => {
+      if (snap.exists() && !isEditMode) {
+        const data = snap.data();
+        if (data.homeBlocks) {
+          console.log(`[Firestore Read] Loaded homeBlocks: ${data.homeBlocks.length} blocks`);
+          setHomeBlocks(data.homeBlocks);
+        }
+      }
+    }, (error) => handleFirestoreError(error, 'onSnapshot-config-home'));
+
+    return () => {
+      unsubscribeConfig();
+      unsubscribeHome();
+    };
   }, [isAuthReady, isEditMode]);
 
   useEffect(() => {
     if (!isAuthReady) return;
 
-    // Stable state for individual collections
-    let groupsArr = [];
-    let itemsArr = [];
-    let sectionsArr = [];
-
-    const updateFullDb = () => {
-      const fullDb = groupsArr.map(g => ({
-        ...g,
-        items: itemsArr.filter(i => i.groupId === g.id).map(i => ({
-          ...i,
-          content: sectionsArr.filter(s => s.itemId === i.id)
-        }))
-      }));
-      setDbData(fullDb as any);
-
-      // Expand all groups by default on first load
-      if (fullDb.length > 0 && !hasInitializedExpanded) {
-        const initialExpanded = {};
-        fullDb.forEach(g => { initialExpanded[g.id] = true; });
-        setExpandedGroups(initialExpanded);
-        setHasInitializedExpanded(true);
-      }
-    };
-
     // Listen for groups
     const qGroups = query(collection(db, 'groups'), orderBy('order', 'asc'));
     const unsubscribeGroups = onSnapshot(qGroups, (snapshot) => {
-      groupsArr = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      updateFullDb();
-    });
+      const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      console.log(`[Firestore Read] Groups: ${data.length} docs`);
+      setGroups(data);
+      
+      // Expand all groups by default on first load
+      if (data.length > 0 && !hasInitializedExpanded) {
+        const initialExpanded = {};
+        data.forEach(g => { initialExpanded[g.id] = true; });
+        setExpandedGroups(prev => ({ ...prev, ...initialExpanded }));
+        setHasInitializedExpanded(true);
+      }
+    }, (error) => handleFirestoreError(error, 'onSnapshot-groups'));
 
     // Listen for items
     const qItems = query(collection(db, 'items'), orderBy('order', 'asc'));
     const unsubscribeItems = onSnapshot(qItems, (snapshot) => {
-      itemsArr = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      updateFullDb();
-    });
+      const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      console.log(`[Firestore Read] Items: ${data.length} docs`);
+      setItems(data);
+    }, (error) => handleFirestoreError(error, 'onSnapshot-items'));
 
     // Listen for sections
     const qSections = query(collection(db, 'sections'), orderBy('order', 'asc'));
     const unsubscribeSections = onSnapshot(qSections, (snapshot) => {
-      sectionsArr = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      updateFullDb();
-    });
+      const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      console.log(`[Firestore Read] Sections: ${data.length} docs`);
+      setSections(data);
+    }, (error) => handleFirestoreError(error, 'onSnapshot-sections'));
 
     return () => {
       unsubscribeGroups();
@@ -384,9 +421,9 @@ const App = () => {
     setExpandedGroups(prev => ({ ...prev, [id]: !prev[id] }));
   };
 
-  const ADMIN_EMAIL = import.meta.env.VITE_ADMIN_EMAIL || 'fannywang062igs@gmail.com';
-  const LOGIN_PASS = import.meta.env.VITE_LOGIN_PASS || 'igs2037';
-  const EDIT_PASS = import.meta.env.VITE_EDIT_PASS || '2037';
+  const ADMIN_EMAIL = (import.meta as any).env.VITE_ADMIN_EMAIL || 'fannywang062igs@gmail.com';
+  const LOGIN_PASS = (import.meta as any).env.VITE_LOGIN_PASS || 'igs2037';
+  const EDIT_PASS = (import.meta as any).env.VITE_EDIT_PASS || '2037';
 
   const verifyPassword = async () => {
     const requiredPass = !user ? LOGIN_PASS : EDIT_PASS;
@@ -422,7 +459,7 @@ const App = () => {
 
   const cancelEdit = () => {
     if (backupData) {
-      setDbData(backupData.dbData);
+      // 資料現在由獨立的 Listener 即時同步，取消時不需要手動還原 dbData
       setHomeBlocks(backupData.homeBlocks);
       setHeaderTitle(backupData.headerTitle);
       setHeaderSubtitle(backupData.headerSubtitle);
@@ -443,31 +480,68 @@ const App = () => {
 
   const handleEditToggle = async () => {
     if (isEditMode) {
-      setLoadingText('正在儲存設定，請稍候...');
+      if (!user) {
+        alert('登入狀態已失效，請重新整理頁面報備。');
+        return;
+      }
+
+      const configData = {
+        headerTitle,
+        headerSubtitle,
+        headerDescription,
+        footerTaxLabel,
+        footerTaxId,
+        footerCopyright,
+        footerScrollText,
+        groupFontSize,
+        itemFontSize,
+        sectionFontSize,
+        contentFontSize,
+        linkFontSize,
+        detailTitleFontSize
+      };
+
+      const homeData = { homeBlocks };
+
+      // 體積檢查
+      const homeSize = getObjectSize(homeData);
+      if (homeSize > 950000) { 
+        alert(`【儲存失敗：內容過大】\n首頁內容約 ${Math.round(homeSize/1024)}KB，已達到單筆資料上限。請刪除一些首頁圖片。`);
+        return;
+      }
+
+      setLoadingText('正在建立安全連線...');
       setIsUploading(true);
+
+      const timeoutVal = 10000; // 10 秒即逾時
+      const saveWithTimeout = (promise: any, msg: string) => 
+        Promise.race([
+          promise,
+          new Promise((_, reject) => setTimeout(() => reject(new Error(`${msg} (連線超時)`)), timeoutVal))
+        ]);
+
       try {
-        await setDoc(doc(db, 'config', 'general'), {
-          headerTitle,
-          headerSubtitle,
-          headerDescription,
-          homeBlocks,
-          footerTaxLabel,
-          footerTaxId,
-          footerCopyright,
-          footerScrollText,
-          groupFontSize,
-          itemFontSize,
-          sectionFontSize,
-          contentFontSize,
-          linkFontSize,
-          detailTitleFontSize
-        });
+        setLoadingText('正在備份目前設定 (1/2)...');
+        await saveWithTimeout(setDoc(doc(db, 'config', 'general'), configData), '儲存基礎設定失敗');
+        
+        setLoadingText('正在儲存首頁內容 (2/2)...');
+        await saveWithTimeout(setDoc(doc(db, 'config', 'home'), homeData), '儲存首頁內容失敗');
+        
         setIsEditMode(false);
+        setBackupData(null);
+        alert('儲存成功！已更新所有設定。');
       } catch (err: any) {
-        handleFirestoreError(err, 'saveConfig');
-        // 如果儲存失敗，不關閉編輯模式，讓使用者可以重試或備份資料
+        console.error("Save failed:", err);
+        if (err.message?.includes('超時')) {
+          alert('【儲存逾時】\n伺服器回應太慢。請嘗試：\n1. 重新整理頁面再儲存。\n2. 檢查網路是否穩定。');
+        } else if (err.message?.includes('too large') || err.message?.includes('1048576')) {
+          alert('【內容過大】\n單次儲存不能超過 1MB (包含所有圖片)。請減少首頁內容。');
+        } else {
+          handleFirestoreError(err, 'saveConfig');
+        }
       } finally {
         setIsUploading(false);
+        setLoadingText('正在處理中...');
       }
     } else {
       setShowPasswordModal(true);
@@ -515,12 +589,24 @@ const App = () => {
   // --- DB Actions ---
   // --- DB Actions (Firestore) ---
   const updateGroupTitle = async (groupId, val) => { 
-    const groupRef = doc(db, 'groups', groupId);
-    await updateDoc(groupRef, { group: val });
+    try {
+      const group = dbData.find(g => g.id === groupId);
+      if (group?.group === val) return;
+      
+      console.log(`[Firestore Write] updateGroupTitle: ${groupId}`);
+      const groupRef = doc(db, 'groups', groupId);
+      await updateDoc(groupRef, { group: val });
+    } catch (error) {
+      handleFirestoreError(error, 'updateGroupTitle');
+    }
   };
 
   const updateGroupProp = async (groupId, prop, val) => {
     try {
+      const group = dbData.find(g => g.id === groupId);
+      if (group?.[prop] === val) return;
+
+      console.log(`[Firestore Write] updateGroupProp: ${groupId}, ${prop}`);
       const groupRef = doc(db, 'groups', groupId);
       await updateDoc(groupRef, { [prop]: val });
     } catch (error) {
@@ -529,12 +615,32 @@ const App = () => {
   };
   
   const updateItemTitle = async (groupId, itemId, val) => { 
-    const itemRef = doc(db, 'items', itemId);
-    await updateDoc(itemRef, { title: val, updatedAt: Date.now() });
+    try {
+      const item = dbData.find(g => g.id === groupId)?.items.find(i => i.id === itemId);
+      if (item?.title === val) return;
+
+      console.log(`[Firestore Write] updateItemTitle: ${itemId}`);
+      const itemRef = doc(db, 'items', itemId);
+      await updateDoc(itemRef, { title: val, updatedAt: Date.now() });
+    } catch (error) {
+      handleFirestoreError(error, 'updateItemTitle');
+    }
   };
 
   const updateItemProp = async (itemId, prop, val) => {
     try {
+      // Find item in all groups
+      let existingVal = undefined;
+      for (const g of dbData) {
+        const item = g.items.find(i => i.id === itemId);
+        if (item) {
+          existingVal = item[prop];
+          break;
+        }
+      }
+      if (existingVal === val) return;
+
+      console.log(`[Firestore Write] updateItemProp: ${itemId}, ${prop}`);
       const itemRef = doc(db, 'items', itemId);
       await updateDoc(itemRef, { [prop]: val, updatedAt: Date.now() });
     } catch (error) {
@@ -544,16 +650,24 @@ const App = () => {
 
   const toggleItemBadge = async (groupId, itemId, e) => {
     e?.stopPropagation();
-    const item = dbData.find(g => g.id === groupId)?.items.find(i => i.id === itemId);
-    if (item) {
-      const itemRef = doc(db, 'items', itemId);
-      await updateDoc(itemRef, { showBadge: !item.showBadge });
+    try {
+      const item = dbData.find(g => g.id === groupId)?.items.find(i => i.id === itemId);
+      if (item) {
+        console.log(`[Firestore Write] toggleItemBadge: ${itemId}`);
+        const itemRef = doc(db, 'items', itemId);
+        await updateDoc(itemRef, { showBadge: !item.showBadge });
+      }
+    } catch (error) {
+      handleFirestoreError(error, 'toggleItemBadge');
     }
   };
 
   const updateSectionTitle = async (gIdx, iIdx, sIdx, val) => { 
     try {
       const section = dbData[gIdx].items[iIdx].content[sIdx];
+      if (section.title === val) return;
+
+      console.log(`[Firestore Write] updateSectionTitle: ${section.id}`);
       const sectionRef = doc(db, 'sections', section.id);
       await updateDoc(sectionRef, { title: val });
       await touchItem(gIdx, iIdx);
@@ -592,31 +706,19 @@ const App = () => {
 
   const updateBlockValue = async (sectionId, bIdx, val) => { 
     try {
-      // 檢查 Base64 字串大小 (約略計算：每 4 個字符代表 3 個位元組)
-      if (typeof val === 'string' && val.startsWith('data:image')) {
-        const estimatedSize = val.length * 0.75;
-        if (estimatedSize > 800 * 1024) { // 超過 800KB
-          alert('這張圖片體積仍然太大，可能會導致儲存失敗。請嘗試更換較小的檔案或解析度。');
-        }
-      }
-
       const sectionRef = doc(db, 'sections', sectionId);
       const sectionSnap = await getDoc(sectionRef);
       if (sectionSnap.exists()) {
         const data = sectionSnap.data();
         const newItems = [...(data.items || [])];
         if (newItems[bIdx]) {
+          if (newItems[bIdx].value === val) return;
+
           newItems[bIdx] = { ...newItems[bIdx], value: val };
           
-          // 檢查整個文檔是否可能超標 (1MB limit)
-          const totalSize = JSON.stringify(newItems).length * 1.5; // 保守估算
-          if (totalSize > 1048576) {
-             alert('警告：此區塊的資料量（包含多張圖片）已接近資料庫上限 (1MB)，建議將內容拆分到多個大區塊，以免儲存失敗。');
-          }
-
+          console.log(`[Firestore Write] updateBlockValue: ${sectionId}, block: ${bIdx}`);
           await updateDoc(sectionRef, { items: newItems });
           
-          // Touch item
           const itemId = data.itemId;
           if (itemId) {
             const itemRef = doc(db, 'items', itemId);
@@ -637,7 +739,10 @@ const App = () => {
         const data = sectionSnap.data();
         const newItems = [...(data.items || [])];
         if (newItems[bIdx]) {
+          if (newItems[bIdx][prop] === val) return;
+
           newItems[bIdx] = { ...newItems[bIdx], [prop]: val };
+          console.log(`[Firestore Write] updateBlockProp: ${sectionId}, block: ${bIdx}, prop: ${prop}`);
           await updateDoc(sectionRef, { items: newItems });
         }
       }
@@ -649,9 +754,13 @@ const App = () => {
   const updateLinkVal = async (gIdx, iIdx, sIdx, lIdx, key, val) => { 
     try {
       const section = dbData[gIdx].items[iIdx].content[sIdx];
+      if (section.links[lIdx]?.[key] === val) return;
+
       const newLinks = section.links.map((ln, idx) => 
         idx === lIdx ? { ...ln, [key]: val } : ln
       );
+      
+      console.log(`[Firestore Write] updateLinkVal: ${section.id}, link: ${lIdx}`);
       const sectionRef = doc(db, 'sections', section.id);
       await updateDoc(sectionRef, { links: newLinks });
       await touchItem(gIdx, iIdx);
@@ -987,7 +1096,7 @@ const App = () => {
         throw new Error(`設定錯誤：您在 Value 欄位填入了 "${apiKey}"。這裡不應該填變數名稱，而是要填入 API Key 本身（例如 AIzaSy... 開頭的一長串亂碼）。請回到 Settings -> Secrets 修改 Web_Key 的 Value。`);
       }
       
-      const ai = new GoogleGenAI({ apiKey });
+      const ai = new GoogleGenAI({ apiKey: apiKey });
       
       const prompt = `你是一個專業的文件整理助手。請將以下亂序或不完整的文字，整理成結構化的手冊內容。
       要求：
@@ -1007,13 +1116,13 @@ const App = () => {
           responseSchema: {
             type: Type.OBJECT,
             properties: {
-              itemTitle: { type: Type.STRING, description: "The main title for this new sub-item" },
+              itemTitle: { type: Type.STRING },
               sections: {
                 type: Type.ARRAY,
                 items: {
                   type: Type.OBJECT,
                   properties: {
-                    title: { type: Type.STRING, description: "Title of the segment" },
+                    title: { type: Type.STRING },
                     type: { type: Type.STRING, enum: ["list", "important", "steps"] },
                     items: {
                       type: Type.ARRAY,
@@ -1021,21 +1130,9 @@ const App = () => {
                         type: Type.OBJECT,
                         properties: {
                           type: { type: Type.STRING, enum: ["text"] },
-                          value: { type: Type.STRING },
-                          isBold: { type: Type.BOOLEAN }
+                          value: { type: Type.STRING }
                         },
                         required: ["type", "value"]
-                      }
-                    },
-                    links: {
-                      type: Type.ARRAY,
-                      items: {
-                        type: Type.OBJECT,
-                        properties: {
-                          label: { type: Type.STRING },
-                          url: { type: Type.STRING }
-                        },
-                        required: ["label", "url"]
                       }
                     }
                   },
@@ -1048,16 +1145,17 @@ const App = () => {
         }
       });
 
-      const text = response.text;
-      if (!text) throw new Error("AI 未返回任何內容");
-      const structuredData = JSON.parse(text);
+      const resText = response.text;
+      if (!resText) throw new Error("AI 未返回任何內容");
+      const structuredData = JSON.parse(resText);
       
       const groupId = aiTargetGroupId;
       const itemId = `i${Date.now()}`;
       const group = dbData.find(g => g.id === groupId);
       const order = group?.items.length || 0;
 
-      await setDoc(doc(db, 'items', itemId), {
+      const batch = writeBatch(db);
+      batch.set(doc(db, 'items', itemId), {
         id: itemId,
         groupId: groupId,
         title: aiNewItemTitle.trim() || structuredData.itemTitle || 'AI 生成項目',
@@ -1065,45 +1163,43 @@ const App = () => {
         updatedAt: Date.now(),
         order
       });
-
-      for (let sIdx = 0; sIdx < structuredData.sections.length; sIdx++) {
-        const section = structuredData.sections[sIdx];
+      
+      structuredData.sections.forEach((s, sIdx) => {
         const sectionId = `${itemId}_ai_${sIdx}`;
-        
-        // Ensure every item in section has an ID
-        const itemsWithIds = (section.items || []).map((it, idx) => ({
-          ...it,
-          id: `ai_b_${Date.now()}_${idx}`
-        }));
-
-        await setDoc(doc(db, 'sections', sectionId), {
+        batch.set(doc(db, 'sections', sectionId), {
           id: sectionId,
           itemId: itemId,
-          title: section.title,
-          type: section.type,
-          items: itemsWithIds,
-          links: section.links || [],
+          title: s.title,
+          type: s.type,
+          items: (s.items || []).map((it, idx) => ({ ...it, id: `ai_b_${Date.now()}_${idx}` })),
+          links: s.links || [],
           order: sIdx
         });
-      }
+      });
 
+      await batch.commit();
       setIsAiModalOpen(false);
       setAiInputText('');
       setAiNewItemTitle('');
+      setAiTargetGroupId(null);
+      alert('AI 整理完成並存入資料庫！');
     } catch (error) {
       console.error("AI Organizing failed:", error);
-      const errorMsg = error instanceof Error ? error.message : String(error);
-      alert(`AI 整理失敗：${errorMsg}\n\n請確保已設定 GEMINI_API_KEY 且輸入內容正確。`);
+      handleFirestoreError(error, 'organizeWithAI');
     } finally {
       setIsOrganizing(false);
     }
   };
 
   const updateSectionIcon = async (gIdx, iIdx, icon) => {
-    const item = dbData[gIdx].items[iIdx];
-    await updateDoc(doc(db, 'items', item.id), {
-      icon: icon
-    });
+    try {
+      const item = dbData[gIdx].items[iIdx];
+      await updateDoc(doc(db, 'items', item.id), {
+        icon: icon
+      });
+    } catch (error) {
+       handleFirestoreError(error, 'updateSectionIcon');
+    }
   };
 
   // --- Derived Data ---
@@ -1165,12 +1261,27 @@ const App = () => {
         {isUploading && (
           <motion.div 
             initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-            className="fixed inset-0 z-[200] bg-slate-900/40 backdrop-blur-sm flex flex-col items-center justify-center gap-6"
+            className="fixed inset-0 z-[200] bg-slate-900/40 backdrop-blur-md flex flex-col items-center justify-center gap-6 p-4"
           >
              <div className="w-16 h-16 border-4 border-indigo-500/20 border-t-indigo-500 rounded-full animate-spin"></div>
-             <div className="bg-white px-8 py-4 rounded-3xl shadow-2xl flex flex-col items-center gap-1">
+             <div className="bg-white px-8 py-6 rounded-3xl shadow-2xl flex flex-col items-center gap-2 max-w-sm text-center">
                <span className="text-xl font-black text-slate-900">{loadingText}</span>
-               <span className="text-xs font-bold text-slate-400 uppercase tracking-widest">系統處理中，請勿關閉視窗</span>
+               <div className="flex flex-col gap-1">
+                 <span className="text-xs font-bold text-slate-400 uppercase tracking-widest">系統處理中，請勿關閉視窗</span>
+                 <p className="text-[10px] text-slate-400 leading-relaxed font-medium">若首頁包含多張高畫質圖片，傳輸可能需要較長時間。請耐心等候。</p>
+               </div>
+               
+               {/* 當儲存顯然卡住時的逃生按鈕 */}
+               <button 
+                 onClick={() => {
+                   if (window.confirm('確定要中止儲存嗎？這可能會導致部分資料未成功上傳，但可以讓您重新嘗試。')) {
+                     setIsUploading(false);
+                   }
+                 }}
+                 className="mt-4 px-4 py-2 text-[10px] font-bold text-slate-300 hover:text-indigo-600 transition-colors uppercase tracking-widest border border-slate-100 rounded-lg"
+               >
+                 如果卡住超過 30 秒，按此取消並重試
+               </button>
              </div>
           </motion.div>
         )}
@@ -1228,10 +1339,10 @@ const App = () => {
                  className="flex items-center gap-2 hover:opacity-80 transition-opacity"
                >
                  <img referrerPolicy="no-referrer" src={user.photoURL} alt={user.displayName} className="w-8 h-8 rounded-full border border-indigo-100" />
-                 <div className="hidden sm:block text-left">
-                    <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest leading-none">{user.displayName}</p>
-                    <p className="text-[9px] text-slate-300 font-bold leading-none mt-1">Administrator</p>
-                 </div>
+                 <span className="hidden sm:block text-left">
+                    <span className="block text-[10px] font-black text-slate-400 uppercase tracking-widest leading-none">{user.displayName}</span>
+                    <span className="block text-[9px] text-slate-300 font-bold leading-none mt-1">Administrator</span>
+                 </span>
                </button>
 
                <AnimatePresence>
@@ -1530,13 +1641,32 @@ const App = () => {
                     {isEditMode && !searchTerm && (
                       <button onClick={addGroup} className="text-xs font-bold text-indigo-600 hover:text-indigo-800 flex items-center gap-1 uppercase tracking-widest"><Plus size={14}/> 增加分類</button>
                     )}
-                    {isEditMode && dbData.length === 0 && (
+                    {isEditMode && groups.length === 0 && (
                       <button onClick={seedDatabase} className="text-xs font-bold text-green-600 hover:text-green-800 flex items-center gap-1 uppercase tracking-widest outline-none"><Save size={14}/> 初始化資料</button>
                     )}
                   </div>
                 </div>
 
-                  {/* Categories Grid - Synchronized stretching with flex h-full */}
+                {/* Categories Grid - Synchronized stretching with flex h-full */}
+                {groups.length === 0 && !searchTerm ? (
+                  <div className="bg-white/50 border border-slate-200 rounded-[2rem] p-12 text-center space-y-4">
+                    <div className="w-16 h-16 bg-slate-100 text-slate-300 rounded-full flex items-center justify-center mx-auto">
+                      <Layers size={32}/>
+                    </div>
+                    <div>
+                      <h4 className="text-lg font-bold text-slate-600">尚未載入資料</h4>
+                      <p className="text-sm text-slate-400">正在連線至雲端資料庫，或目前尚無建立任何分類。</p>
+                    </div>
+                    {user && (
+                      <button 
+                        onClick={seedDatabase}
+                        className="px-6 py-2 bg-indigo-600 text-white rounded-full text-xs font-bold uppercase tracking-widest hover:bg-indigo-700 transition-colors"
+                      >
+                        點此初始化範例資料
+                      </button>
+                    )}
+                  </div>
+                ) : (
                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-8">
                     {filteredMenu.map((group, gIdx) => (
                       <motion.div 
@@ -1626,9 +1756,16 @@ const App = () => {
                             >
                               {group.items.map((item, iIdx) => (
                                 <div key={item.id} className="group/item flex items-center gap-2">
-                                  <button
+                                  <div
+                                    role="button"
+                                    tabIndex={0}
                                     onClick={() => setActiveId(item.id)}
-                                    className={`flex-grow text-left ${isEditMode ? 'p-4' : 'p-2.5'} rounded-2xl hover:bg-slate-50 border border-transparent hover:border-slate-100 flex items-center justify-between transition-all`}
+                                    className={`flex-grow cursor-pointer text-left ${isEditMode ? 'p-4' : 'p-2.5'} rounded-2xl hover:bg-slate-50 border border-transparent hover:border-slate-100 flex items-center justify-between transition-all`}
+                                    onKeyDown={(e) => {
+                                      if (e.key === 'Enter' || e.key === ' ') {
+                                        setActiveId(item.id);
+                                      }
+                                    }}
                                   >
                                   <div className="flex-grow flex items-center gap-4 overflow-hidden">
                                     <div className="shrink-0 w-2 h-2 rounded-full bg-slate-200 group-hover/item:bg-indigo-500 transition-colors"></div>
@@ -1673,8 +1810,8 @@ const App = () => {
                                         <ArrowRight size={14} className="text-indigo-500"/>
                                      </div>
                                   )}
-                                </button>
-                                {isEditMode && (
+                                  </div>
+                                  {isEditMode && (
                                   <div className="shrink-0 flex items-center bg-indigo-50 rounded-xl p-1 border border-indigo-100 shadow-sm z-20">
                                     <button onClick={(e) => moveItem(group.id, item.id, 'up', e)} className="p-2 text-indigo-400 hover:text-indigo-700 hover:bg-white rounded-lg transition-all" title="上移">
                                       <ArrowUp size={14}/>
@@ -1713,7 +1850,8 @@ const App = () => {
                       </motion.div>
                     ))}
                   </div>
-                </div>
+                )}
+              </div>
 
                 {/* Categories Grid - Refined Layout removed duplicates check */}
               </motion.div>
