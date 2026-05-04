@@ -121,7 +121,7 @@ const handleFirestoreError = (error: any, operation: string) => {
   }
 };
 
-const compressImage = (base64Str: string, maxWidth = 1024): Promise<string> => {
+const compressImage = (base64Str: string, maxWidth = 800): Promise<string> => {
   return new Promise((resolve) => {
     const img = new Image();
     img.src = base64Str;
@@ -139,8 +139,8 @@ const compressImage = (base64Str: string, maxWidth = 1024): Promise<string> => {
       canvas.height = height;
       const ctx = canvas.getContext('2d');
       ctx?.drawImage(img, 0, 0, width, height);
-      // 使用 jpeg 格式並設定品質為 0.7 來大幅縮減體積
-      resolve(canvas.toDataURL('image/jpeg', 0.7));
+      // 使用 jpeg 格式並將品質設定為 0.5 確保不會超過 1MB 限制
+      resolve(canvas.toDataURL('image/jpeg', 0.5));
     };
   });
 };
@@ -377,6 +377,8 @@ const App = () => {
     alert("資料庫已成功初始化");
   };
 
+  const [loadingText, setLoadingText] = useState('正在處理中...');
+
   // --- Logic Helpers ---
   const toggleGroup = (id) => {
     setExpandedGroups(prev => ({ ...prev, [id]: !prev[id] }));
@@ -441,6 +443,8 @@ const App = () => {
 
   const handleEditToggle = async () => {
     if (isEditMode) {
+      setLoadingText('正在儲存設定，請稍候...');
+      setIsUploading(true);
       try {
         await setDoc(doc(db, 'config', 'general'), {
           headerTitle,
@@ -458,10 +462,13 @@ const App = () => {
           linkFontSize,
           detailTitleFontSize
         });
-      } catch (err) {
-        console.error("Failed to save config:", err);
+        setIsEditMode(false);
+      } catch (err: any) {
+        handleFirestoreError(err, 'saveConfig');
+        // 如果儲存失敗，不關閉編輯模式，讓使用者可以重試或備份資料
+      } finally {
+        setIsUploading(false);
       }
-      setIsEditMode(false);
     } else {
       setShowPasswordModal(true);
       setPasswordInput('');
@@ -585,6 +592,14 @@ const App = () => {
 
   const updateBlockValue = async (sectionId, bIdx, val) => { 
     try {
+      // 檢查 Base64 字串大小 (約略計算：每 4 個字符代表 3 個位元組)
+      if (typeof val === 'string' && val.startsWith('data:image')) {
+        const estimatedSize = val.length * 0.75;
+        if (estimatedSize > 800 * 1024) { // 超過 800KB
+          alert('這張圖片體積仍然太大，可能會導致儲存失敗。請嘗試更換較小的檔案或解析度。');
+        }
+      }
+
       const sectionRef = doc(db, 'sections', sectionId);
       const sectionSnap = await getDoc(sectionRef);
       if (sectionSnap.exists()) {
@@ -592,6 +607,13 @@ const App = () => {
         const newItems = [...(data.items || [])];
         if (newItems[bIdx]) {
           newItems[bIdx] = { ...newItems[bIdx], value: val };
+          
+          // 檢查整個文檔是否可能超標 (1MB limit)
+          const totalSize = JSON.stringify(newItems).length * 1.5; // 保守估算
+          if (totalSize > 1048576) {
+             alert('警告：此區塊的資料量（包含多張圖片）已接近資料庫上限 (1MB)，建議將內容拆分到多個大區塊，以免儲存失敗。');
+          }
+
           await updateDoc(sectionRef, { items: newItems });
           
           // Touch item
@@ -674,6 +696,7 @@ const App = () => {
   const handleImageUpload = (sectionId, bIdx, e) => {
     const file = e.target.files[0];
     if (file) {
+      setLoadingText('正在優化圖片體積...');
       setIsUploading(true);
       const reader = new FileReader();
       reader.onloadend = async () => {
@@ -700,6 +723,7 @@ const App = () => {
     if (!items) return;
     for (let i = 0; i < items.length; i++) {
       if (items[i].type.indexOf('image') !== -1) {
+        setLoadingText('正在處理剪貼簿圖片...');
         setIsUploading(true);
         const file = items[i].getAsFile();
         if (file) {
@@ -1145,8 +1169,8 @@ const App = () => {
           >
              <div className="w-16 h-16 border-4 border-indigo-500/20 border-t-indigo-500 rounded-full animate-spin"></div>
              <div className="bg-white px-8 py-4 rounded-3xl shadow-2xl flex flex-col items-center gap-1">
-               <span className="text-xl font-black text-slate-900">正在處理圖片...</span>
-               <span className="text-xs font-bold text-slate-400 uppercase tracking-widest">請稍候，優化中</span>
+               <span className="text-xl font-black text-slate-900">{loadingText}</span>
+               <span className="text-xs font-bold text-slate-400 uppercase tracking-widest">系統處理中，請勿關閉視窗</span>
              </div>
           </motion.div>
         )}
@@ -1249,8 +1273,17 @@ const App = () => {
             </button>
           )}
           {user && user.email === ADMIN_EMAIL ? (
-            <button onClick={handleEditToggle} className={`flex items-center gap-2 px-6 py-2 rounded-full text-xs font-bold tracking-tight transition-all ${isEditMode ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-100' : 'bg-slate-100 border border-slate-200 text-slate-600 hover:bg-indigo-600 hover:text-white'}`}>
-              {isEditMode ? <Save size={14}/> : null} {isEditMode ? '完成並儲存' : 'ADMIN'}
+            <button 
+              onClick={handleEditToggle} 
+              disabled={isUploading}
+              className={`flex items-center gap-2 px-6 py-2 rounded-full text-xs font-bold tracking-tight transition-all ${isUploading ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : isEditMode ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-100 hover:bg-indigo-700' : 'bg-slate-100 border border-slate-200 text-slate-600 hover:bg-indigo-600 hover:text-white'}`}
+            >
+              {isUploading ? (
+                <div className="w-3 h-3 border-2 border-slate-400 border-t-transparent rounded-full animate-spin"></div>
+              ) : isEditMode ? (
+                <Save size={14}/>
+              ) : null}
+              {isUploading ? '處理中...' : isEditMode ? '完成並儲存' : 'ADMIN'}
             </button>
           ) : !user ? (
             <button 
