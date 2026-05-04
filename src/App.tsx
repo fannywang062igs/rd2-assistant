@@ -206,7 +206,8 @@ const App = () => {
   const [sections, setSections] = useState<any[]>([]);
   
   const [user, setUser] = useState(null);
-
+  const [isSnapshotReady, setIsSnapshotReady] = useState(false);
+  
   const dbData = useMemo(() => {
     return groups.map(g => ({
       ...g,
@@ -332,6 +333,7 @@ const App = () => {
       const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
       console.log(`[Firestore Read] Groups: ${data.length} docs`);
       setGroups(data);
+      setIsSnapshotReady(true);
       
       // Expand all groups by default on first load
       if (data.length > 0 && !hasInitializedExpanded) {
@@ -1430,6 +1432,83 @@ const App = () => {
                 className="overflow-hidden"
               >
                 <div className="flex flex-wrap items-center gap-x-8 gap-y-4 py-4 pt-2 border-t border-slate-50 mt-2">
+                  {/* 資料庫審計與統計 */}
+                  {(() => {
+                    const allImages = sections.flatMap(s => s.items || []).filter(it => it.type === 'image' && it.value);
+                    const homeImages = homeBlocks.filter(b => b.type === 'image' && b.content);
+                    const totalImageSize = allImages.reduce((acc, it) => acc + (it.value.length || 0), 0) + 
+                                          homeImages.reduce((acc, it) => acc + (it.content.length || 0), 0);
+                    
+                    const totalDocSize = JSON.stringify({ groups, items, sections, homeBlocks }).length;
+                    
+                    // 找出孤兒區塊 (itemId 不存在的 sections)
+                    const orphanedSections = sections.filter(s => !items.find(i => i.id === s.itemId));
+                    
+                    const handleCleanup = async () => {
+                      if (!window.confirm(`確定要清理 ${orphanedSections.length} 個孤立區塊嗎？這些是因刪除項目後殘留的資料，刪除後可釋放空間。`)) return;
+                      setIsUploading(true);
+                      setLoadingText('正在清理資料庫...');
+                      try {
+                        const batch = writeBatch(db);
+                        orphanedSections.forEach(s => {
+                          batch.delete(doc(db, 'sections', s.id));
+                        });
+                        await batch.commit();
+                        alert(`清理完成！已刪除 ${orphanedSections.length} 個遺留區塊。`);
+                      } catch (err) {
+                        handleFirestoreError(err, 'cleanupOrphans');
+                      } finally {
+                        setIsUploading(false);
+                      }
+                    };
+
+                    const sortedImages = [...allImages.map(i => ({...i, source: '內容'}))];
+                    homeImages.forEach(hi => sortedImages.push({ id: hi.id, value: hi.content, source: '首頁' } as any));
+                    sortedImages.sort((a, b) => (b.value?.length || 0) - (a.value?.length || 0));
+
+                    return (
+                      <div className="flex flex-wrap items-center gap-4 border-r border-slate-100 pr-8">
+                        <div className="flex flex-col gap-1">
+                          <div className="flex items-center gap-2">
+                             <ImageIcon size={14} className="text-indigo-400" />
+                             <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">
+                               圖片總量: <span className={totalImageSize > 800000 ? 'text-amber-600' : 'text-indigo-600'}>{(totalImageSize / (1024 * 1024)).toFixed(2)} MB</span>
+                             </span>
+                          </div>
+                          <div className="flex items-center gap-2">
+                             <Layers size={14} className="text-slate-300" />
+                             <span className="text-[9px] font-bold text-slate-400 uppercase tracking-widest">
+                               運作資料: {(totalDocSize / 1024).toFixed(0)} KB
+                             </span>
+                          </div>
+                        </div>
+                        
+                        {sortedImages.length > 0 && (
+                          <div className="flex flex-col gap-1">
+                            <div className="flex items-center gap-2">
+                              <AlertCircle size={14} className="text-amber-400" />
+                              <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest leading-none">
+                                最大圖片: <span className="text-indigo-600 font-mono">{(sortedImages[0].value.length / 1024).toFixed(0)} KB</span>
+                                <span className="ml-1 text-[8px] text-slate-300">({sortedImages[0].source})</span>
+                              </span>
+                            </div>
+                            {orphanedSections.length > 0 && (
+                              <button 
+                                onClick={handleCleanup}
+                                className="flex items-center gap-1 group/cleanup"
+                              >
+                                <Trash2 size={10} className="text-red-400 group-hover/cleanup:text-red-600" />
+                                <span className="text-[9px] font-black text-red-400 group-hover/cleanup:text-red-600 underline">
+                                  發現 {orphanedSections.length} 個遺留垃圾 (請點此清理)
+                                </span>
+                              </button>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
+
                   <div className="flex items-center gap-2">
                     <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">內容標題:</span>
                     <input type="range" min="16" max="64" value={detailTitleFontSize} onChange={(e) => setDetailTitleFontSize(parseInt(e.target.value))} className="w-20 accent-indigo-600 h-1.5 bg-slate-100 rounded-full appearance-none cursor-pointer" />
@@ -1648,7 +1727,24 @@ const App = () => {
                 </div>
 
                 {/* Categories Grid - Synchronized stretching with flex h-full */}
-                {groups.length === 0 && !searchTerm ? (
+                {!isSnapshotReady ? (
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-8">
+                    {[1, 2, 3, 4].map((i) => (
+                      <div key={i} className="bg-white border border-slate-200 rounded-[2rem] p-8 animate-pulse space-y-6">
+                        <div className="w-12 h-12 bg-slate-100 rounded-2xl"></div>
+                        <div className="space-y-3">
+                          <div className="h-6 bg-slate-100 rounded-full w-3/4"></div>
+                          <div className="h-4 bg-slate-100 rounded-full w-1/2"></div>
+                        </div>
+                        <div className="space-y-2 pt-4 border-t border-slate-50">
+                          <div className="h-3 bg-slate-50 rounded-full w-full"></div>
+                          <div className="h-3 bg-slate-50 rounded-full w-full"></div>
+                          <div className="h-3 bg-slate-50 rounded-full w-2/3"></div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : groups.length === 0 && !searchTerm ? (
                   <div className="bg-white/50 border border-slate-200 rounded-[2rem] p-12 text-center space-y-4">
                     <div className="w-16 h-16 bg-slate-100 text-slate-300 rounded-full flex items-center justify-center mx-auto">
                       <Layers size={32}/>
