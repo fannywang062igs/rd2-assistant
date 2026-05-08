@@ -2498,7 +2498,7 @@ const App = () => {
                  <img 
                     referrerPolicy="no-referrer"
                    src={fullscreenImage} 
-                    className="max-w-full max-h-full rounded-2xl shadow-2xl object-contain transition-transform duration-200 ease-out hover:scale-[2.5]"
+                    className="max-w-full max-h-full rounded-2xl shadow-2xl object-contain transition-transform duration-200 ease-out hover:scale-[1.5]"
                     alt="Expanded view"
                   />
                </motion.div>
