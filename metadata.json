@@ -1,6 +1,6 @@
 {
-  "name": "RD2 行政百科",
-  "description": "研發二部一站式行政資源門戶：報帳規範、出差流程、外包作業與員工福利完整指南。",
+  "name": "RD2行政資訊查詢系統",
+  "description": "📋 瀏覽資料 🤖 行政小幫手 💬 相關行政問題及作業報帳流程參考。",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
