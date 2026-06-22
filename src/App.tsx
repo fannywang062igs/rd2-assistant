@@ -154,8 +154,8 @@ const compressImage = (base64Str: string, maxWidth = 800): Promise<string> => {
       canvas.height = height;
       const ctx = canvas.getContext('2d');
       ctx?.drawImage(img, 0, 0, width, height);
-      // 使用 jpeg 格式並將品質設定為 0.4 進一步減少體積
-      resolve(canvas.toDataURL('image/jpeg', 0.4));
+      // 使用 jpeg 格式並將品質設定為 0.6 進一步減少體積
+      resolve(canvas.toDataURL('image/jpeg', 0.6));
     };
   });
 };
