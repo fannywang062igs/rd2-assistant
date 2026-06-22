@@ -813,8 +813,11 @@ const App = () => {
       reader.onloadend = async () => {
         if (typeof reader.result === 'string') {
           try {
-            const compressed = await compressImage(reader.result);
-            await updateBlockValue(sectionId, bIdx, compressed);
+            // 超過 200K (200 * 1024 bytes) 才進行壓縮，否則直接使用原圖
+            const finalImage = file.size > 200 * 1024
+              ? await compressImage(reader.result)
+              : reader.result;
+            await updateBlockValue(sectionId, bIdx, finalImage);
           } catch (err) {
             console.error("Upload process failed:", err);
           } finally {
@@ -842,8 +845,11 @@ const App = () => {
           reader.onloadend = async () => {
             if (typeof reader.result === 'string') {
               try {
-                const compressed = await compressImage(reader.result);
-                await updateBlockValue(sectionId, bIdx, compressed);
+                // 超過 200K (200 * 1024 bytes) 才進行壓縮，否則直接使用原圖
+                const finalImage = file.size > 200 * 1024
+                  ? await compressImage(reader.result)
+                  : reader.result;
+                await updateBlockValue(sectionId, bIdx, finalImage);
               } catch (err) {
                 console.error("Paste process failed:", err);
               } finally {
