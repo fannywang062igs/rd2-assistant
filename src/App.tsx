@@ -1278,14 +1278,20 @@ const App = () => {
     }
 
     if (activeId && searchTerm.trim() && mainScrollRef.current) {
-      // 等待 DOM 與動畫渲染完畢後，自動定位到第一個標註關鍵字的地方
-      const timer = setTimeout(() => {
-        const firstMark = mainScrollRef.current?.querySelector('mark');
+      // 使用輪詢（Polling）方式，當 detail 視窗完成掛載且包含 mark 元素時，自動定位到第一個標註關鍵字的地方
+      let attempts = 0;
+      const interval = setInterval(() => {
+        const firstMark = mainScrollRef.current?.querySelector('#resource-detail-view mark');
         if (firstMark) {
           firstMark.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          clearInterval(interval);
         }
-      }, 150);
-      return () => clearTimeout(timer);
+        attempts++;
+        if (attempts > 40) { // 最多輪詢 2 秒 (40 * 50ms)
+          clearInterval(interval);
+        }
+      }, 50);
+      return () => clearInterval(interval);
     }
   }, [activeId, searchTerm]);
 
@@ -1994,6 +2000,7 @@ const App = () => {
             ) : (
               /* Detail View - Preservation of logic with Indigo/Slate theme */
               <motion.div 
+                id="resource-detail-view"
                 key="detail"
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
