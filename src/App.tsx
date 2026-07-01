@@ -136,6 +136,29 @@ const getObjectSize = (obj: any) => {
   }
 };
 
+const escapeRegExp = (str: string) => {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+};
+
+const highlightText = (text: string, search: string) => {
+  if (!search || !search.trim()) return text;
+  const regex = new RegExp(`(${escapeRegExp(search)})`, 'gi');
+  const parts = text.split(regex);
+  return (
+    <>
+      {parts.map((part, i) => 
+        regex.test(part) ? (
+          <mark key={i} className="bg-amber-200 text-amber-950 font-black px-1 rounded-md shadow-sm ring-1 ring-amber-300">
+            {part}
+          </mark>
+        ) : (
+          part
+        )
+      )}
+    </>
+  );
+};
+
 const compressImage = (base64Str: string, maxWidth = 800): Promise<string> => {
   return new Promise((resolve) => {
     const img = new Image();
@@ -1253,7 +1276,18 @@ const App = () => {
     if (mainScrollRef.current) {
       mainScrollRef.current.scrollTo(0, 0);
     }
-  }, [activeId]);
+
+    if (activeId && searchTerm.trim() && mainScrollRef.current) {
+      // 等待 DOM 與動畫渲染完畢後，自動定位到第一個標註關鍵字的地方
+      const timer = setTimeout(() => {
+        const firstMark = mainScrollRef.current?.querySelector('mark');
+        if (firstMark) {
+          firstMark.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+      }, 150);
+      return () => clearTimeout(timer);
+    }
+  }, [activeId, searchTerm]);
 
   return (
     <div className="h-screen flex flex-col font-sans text-slate-900 bg-slate-50 overflow-hidden selection:bg-indigo-600/10 relative">
@@ -1810,7 +1844,7 @@ const App = () => {
                                 />
                               ) : (
                                 <h3 className="font-black text-slate-800 group-hover:text-indigo-600 transition-colors leading-tight" style={{ fontSize: `${groupFontSize}px` }}>
-                                  {group.group}
+                                  {highlightText(group.group, searchTerm)}
                                 </h3>
                               )}
                             </div>
@@ -1891,7 +1925,7 @@ const App = () => {
                                       ) : (
                                         <div className="flex items-center gap-2 overflow-hidden">
                                           <span className="truncate font-bold text-slate-600 group-hover/item:text-slate-900 transition-colors" style={{ fontSize: `${itemFontSize}px` }}>
-                                             {item.title}
+                                             {highlightText(item.title, searchTerm)}
                                              {item.content?.some(s => s.items?.some(it => it.type === 'image' && it.value)) && (
                                                <ImageIcon size={10} className="inline ml-1.5 text-indigo-400 opacity-60" />
                                              )}
@@ -2014,9 +2048,9 @@ const App = () => {
                         ) : (
                           <>
                             <span className="text-[10px] font-black text-indigo-600 uppercase tracking-widest block">{dbData[activeItemData.gIdx].group}</span>
-                            <h2 className="font-bold text-slate-900 tracking-tight" style={{ fontSize: `${detailTitleFontSize}px` }}>{activeItemData.title}</h2>
+                            <h2 className="font-bold text-slate-900 tracking-tight" style={{ fontSize: `${detailTitleFontSize}px` }}>{highlightText(activeItemData.title, searchTerm)}</h2>
                             {activeItemData.description && (
-                              <p className="text-slate-500 font-medium mt-2 leading-relaxed">{activeItemData.description}</p>
+                              <p className="text-slate-500 font-medium mt-2 leading-relaxed">{highlightText(activeItemData.description, searchTerm)}</p>
                             )}
                           </>
                         )}
@@ -2041,7 +2075,7 @@ const App = () => {
                               }}
                             />
                           ) : (
-                            <h3 className="font-bold uppercase tracking-widest text-slate-800" style={{ fontSize: `${sectionFontSize}px` }}>{sec.title}</h3>
+                            <h3 className="font-bold uppercase tracking-widest text-slate-800" style={{ fontSize: `${sectionFontSize}px` }}>{highlightText(sec.title, searchTerm)}</h3>
                           )}
                           
                           {isEditMode && (
@@ -2096,7 +2130,7 @@ const App = () => {
                                           toggleBold(activeItemData.gIdx, activeItemData.iIdx, currentSIdx, i);
                                         }} className={`text-[10px] uppercase tracking-widest font-bold px-3 py-1 rounded-md transition-colors ${it.isBold ? 'bg-indigo-600 text-white' : 'bg-slate-100 text-slate-400 hover:bg-slate-200'}`}>B</button>
                                       </div>
-                                    ) : ( <p className={`leading-relaxed whitespace-pre-wrap ${it.isBold ? 'font-bold text-slate-900' : 'text-slate-600'}`} style={{ fontSize: `${contentFontSize}px` }}>{it.value}</p> )
+                                    ) : ( <p className={`leading-relaxed whitespace-pre-wrap ${it.isBold ? 'font-bold text-slate-900' : 'text-slate-600'}`} style={{ fontSize: `${contentFontSize}px` }}>{highlightText(it.value, searchTerm)}</p> )
                                   ) : (
                                     <div 
                                       tabIndex={isEditMode ? 0 : -1}
@@ -2263,7 +2297,7 @@ const App = () => {
                                       </div>
                                     ) : (
                                       <a href={link.url} target="_blank" rel="noreferrer" className="inline-flex items-center px-5 py-2.5 bg-white text-indigo-600 border border-slate-200 rounded-xl font-bold text-xs uppercase tracking-tight hover:bg-indigo-600 hover:text-white transition-all shadow-sm">
-                                        <LinkIcon size={14} className="mr-2"/> {link.label}
+                                        <LinkIcon size={14} className="mr-2"/> {highlightText(link.label, searchTerm)}
                                       </a>
                                     )}
                                   </div>
