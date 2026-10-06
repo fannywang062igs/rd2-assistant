@@ -8,16 +8,6 @@ export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId); // Use 
 export const auth = getAuth(app);
 export const googleProvider = new GoogleAuthProvider();
 
-// Connection test
-async function testConnection() {
-  try {
-    await getDocFromServer(doc(db, 'test', 'connection'));
-  } catch (error) {
-    if (error instanceof Error && error.message.includes('the client is offline')) {
-      console.error("Please check your Firebase configuration.");
-    }
-  }
-}
-testConnection();
-
+// Connection test removed to conserve Firestore daily read quota
 export { signInWithPopup, onAuthStateChanged, signOut };
+

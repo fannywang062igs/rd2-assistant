@@ -6,7 +6,8 @@ import {
   Trash2, ArrowUp, ArrowDown, Bold, ImageIcon, Upload,
   Plus, AlertCircle, Trash2 as TrashIcon, ArrowRight,
   Link as LinkIcon, ImagePlus, Wand2, Sparkles, X, Brain,
-  LogOut, User as UserIcon, Settings
+  LogOut, User as UserIcon, Settings, RefreshCw, ShieldCheck,
+  CheckCircle2, Clock
 } from 'lucide-react';
 import { INITIAL_DB, iconMap } from './constants';
 import { GoogleGenAI, Type } from "@google/genai";
@@ -25,6 +26,36 @@ import {
   writeBatch
 } from 'firebase/firestore';
 
+
+// ImageWidthSlider component to prevent Firestore write spamming while dragging
+const ImageWidthSlider = ({ value, onChangeCommitted }: { value: number; onChangeCommitted: (val: number) => void }) => {
+  const [val, setVal] = useState(value || 100);
+
+  useEffect(() => {
+    setVal(value || 100);
+  }, [value]);
+
+  return (
+    <div className="w-full bg-white/10 rounded-xl p-3 border border-white/10 space-y-2">
+      <div className="flex justify-between items-center text-[10px] font-black text-white uppercase tracking-widest">
+        <span>圖片寬度</span>
+        <span>{val}%</span>
+      </div>
+      <input 
+        type="range" min="20" max="100" 
+        value={val} 
+        onChange={(e) => setVal(parseInt(e.target.value))}
+        onMouseUp={() => {
+          if (val !== value) onChangeCommitted(val);
+        }}
+        onTouchEnd={() => {
+          if (val !== value) onChangeCommitted(val);
+        }}
+        className="w-full accent-white h-1 bg-white/20 rounded-full appearance-none cursor-pointer" 
+      />
+    </div>
+  );
+};
 
 // --- Helper Components for Edit Mode (Defined Outside to avoid re-mounting) ---
 const DebouncedTextarea = ({ value, onChange, className, style, ...props }: any) => {
@@ -113,13 +144,18 @@ const DebouncedInput = ({ value, onChange, className, style, ...props }: any) =>
 };
 
 const handleFirestoreError = (error: any, operation: string) => {
-  console.error(`Firestore Error [${operation}]:`, error);
-  const msg = error.message || '';
+  console.warn(`Firestore Warning/Error [${operation}]:`, error);
+  const msg = error?.message || '';
+  
+  // Background listener error - do not interrupt visitors with alerts
+  if (operation.startsWith('onSnapshot')) {
+    return;
+  }
   
   if (msg.includes('exceeds the maximum allowed size') || msg.includes('too large')) {
     alert('【儲存失敗：資料量超標】\n您的設定內容太大（超過 1MB）。請更換較小的圖片或減少文字內容。');
   } else if (msg.includes('resource-exhausted') || msg.includes('Quota exceeded')) {
-    alert('【系統配額已達上限】\n今日資料庫的寫入次數已達 Firebase 免費额度上限。請：\n1. 等待明日配額重置 (台灣時間約下午 3~4 點)。\n2. 暫時不要頻繁點擊儲存。');
+    alert('【系統配額已達上限】\n今日資料庫的讀寫次數已達 Firebase 免費額度上限。請：\n1. 等待明日配額重置 (台灣時間約下午 3~4 點)。\n2. 暫時不要頻繁點擊儲存，或升級 Firebase 專案為 Blaze 隨用隨付。');
   } else if (msg.includes('insufficient permissions')) {
     alert('【操作失敗：權限不足】\n請確認：\n1. 您是否已登入正確的 Admin 帳號。\n2. 您的 Email 是否已通過驗證。\n3. 建議重新整理頁面再試。');
   } else {
@@ -222,14 +258,62 @@ const IconPicker = ({ currentIcon, onChange, size = 18 }: { currentIcon: string,
   );
 };
 
+const CACHE_KEY = 'rd2_encyclopedia_cache_v2';
+
+const getInitialCache = () => {
+  try {
+    const raw = localStorage.getItem(CACHE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed.groups) && parsed.groups.length > 0) {
+        return {
+          groups: parsed.groups,
+          items: Array.isArray(parsed.items) ? parsed.items : [],
+          sections: Array.isArray(parsed.sections) ? parsed.sections : [],
+          homeBlocks: Array.isArray(parsed.homeBlocks) ? parsed.homeBlocks : [],
+          config: parsed.config || null,
+          hasCachedData: true
+        };
+      }
+    }
+  } catch (e) {
+    console.warn('Failed to parse cache from localStorage:', e);
+  }
+  // No old drafts or template mock data when cache is empty!
+  return {
+    groups: [],
+    items: [],
+    sections: [],
+    homeBlocks: [],
+    config: null,
+    hasCachedData: false
+  };
+};
+
+const saveToCache = (partial: any) => {
+  try {
+    const raw = localStorage.getItem(CACHE_KEY);
+    const existing = raw ? JSON.parse(raw) : {};
+    const updated = { ...existing, ...partial, lastUpdated: Date.now() };
+    localStorage.setItem(CACHE_KEY, JSON.stringify(updated));
+  } catch (e) {
+    console.warn('Failed to update local cache:', e);
+  }
+};
+
+const initialCached = getInitialCache();
+
 const App = () => {
   // --- States ---
-  const [groups, setGroups] = useState<any[]>([]);
-  const [items, setItems] = useState<any[]>([]);
-  const [sections, setSections] = useState<any[]>([]);
+  const [groups, setGroups] = useState<any[]>(initialCached.groups);
+  const [items, setItems] = useState<any[]>(initialCached.items);
+  const [sections, setSections] = useState<any[]>(initialCached.sections);
   
   const [user, setUser] = useState(null);
-  const [isSnapshotReady, setIsSnapshotReady] = useState(false);
+  const [isSnapshotReady, setIsSnapshotReady] = useState(initialCached.hasCachedData);
+  const [isQuotaLimited, setIsQuotaLimited] = useState(false);
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [retryCount, setRetryCount] = useState(0);
   
   const dbData = useMemo(() => {
     return groups.map(g => ({
@@ -269,25 +353,29 @@ const App = () => {
   const [passwordError, setPasswordError] = useState(false);
   
   // Font Sizes
-  const [detailTitleFontSize, setDetailTitleFontSize] = useState(36);
-  const [groupFontSize, setGroupFontSize] = useState(16);
-  const [itemFontSize, setItemFontSize] = useState(14);
-  const [sectionFontSize, setSectionFontSize] = useState(18);
-  const [contentFontSize, setContentFontSize] = useState(14);
-  const [linkFontSize, setLinkFontSize] = useState(12);
+  const [detailTitleFontSize, setDetailTitleFontSize] = useState(initialCached.config?.detailTitleFontSize || 36);
+  const [groupFontSize, setGroupFontSize] = useState(initialCached.config?.groupFontSize || 16);
+  const [itemFontSize, setItemFontSize] = useState(initialCached.config?.itemFontSize || 14);
+  const [sectionFontSize, setSectionFontSize] = useState(initialCached.config?.sectionFontSize || 18);
+  const [contentFontSize, setContentFontSize] = useState(initialCached.config?.contentFontSize || 14);
+  const [linkFontSize, setLinkFontSize] = useState(initialCached.config?.linkFontSize || 12);
   const [backupData, setBackupData] = useState(null);
 
   // Layout States
-  const [expandedGroups, setExpandedGroups] = useState({});
-  const [hasInitializedExpanded, setHasInitializedExpanded] = useState(false);
-  const [headerTitle, setHeaderTitle] = useState('RD2 行政百科');
-  const [headerSubtitle, setHeaderSubtitle] = useState('Executive Encyclopedia');
-  const [headerDescription, setHeaderDescription] = useState('一站式行政資源，精準搜尋，快速導航。');
-  const [footerTaxLabel, setFooterTaxLabel] = useState('TAX ID:');
-  const [footerTaxId, setFooterTaxId] = useState('23519738');
-  const [footerCopyright, setFooterCopyright] = useState('IGS · ACD RD2 Manual');
-  const [footerScrollText, setFooterScrollText] = useState('Scroll Top ↑');
-  const [homeBlocks, setHomeBlocks] = useState([]);
+  const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>(() => {
+    const initialExpanded: Record<string, boolean> = {};
+    initialCached.groups.forEach((g: any) => { initialExpanded[g.id] = true; });
+    return initialExpanded;
+  });
+  const [hasInitializedExpanded, setHasInitializedExpanded] = useState(true);
+  const [headerTitle, setHeaderTitle] = useState(initialCached.config?.headerTitle || 'RD2 行政百科');
+  const [headerSubtitle, setHeaderSubtitle] = useState(initialCached.config?.headerSubtitle || 'Executive Encyclopedia');
+  const [headerDescription, setHeaderDescription] = useState(initialCached.config?.headerDescription || '一站式行政資源，精準搜尋，快速導航。');
+  const [footerTaxLabel, setFooterTaxLabel] = useState(initialCached.config?.footerTaxLabel || 'TAX ID:');
+  const [footerTaxId, setFooterTaxId] = useState(initialCached.config?.footerTaxId || '23519738');
+  const [footerCopyright, setFooterCopyright] = useState(initialCached.config?.footerCopyright || 'IGS · ACD RD2 Manual');
+  const [footerScrollText, setFooterScrollText] = useState(initialCached.config?.footerScrollText || 'Scroll Top ↑');
+  const [homeBlocks, setHomeBlocks] = useState(initialCached.homeBlocks || []);
   const [fullscreenImage, setFullscreenImage] = useState(null);
   const mainScrollRef = useRef<HTMLElement>(null);
 
@@ -300,6 +388,14 @@ const App = () => {
   const [showFontControls, setShowFontControls] = useState(false);
 
   // --- Auth & Data Fetching ---
+  const handleManualRetry = () => {
+    setIsConnecting(true);
+    setRetryCount(prev => prev + 1);
+    setTimeout(() => {
+      setIsConnecting(false);
+    }, 2500);
+  };
+
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (u) => {
       setUser(u);
@@ -327,8 +423,15 @@ const App = () => {
         if (data.sectionFontSize) setSectionFontSize(data.sectionFontSize);
         if (data.contentFontSize) setContentFontSize(data.contentFontSize);
         if (data.linkFontSize) setLinkFontSize(data.linkFontSize);
+        saveToCache({ config: data });
       }
-    }, (error) => handleFirestoreError(error, 'onSnapshot-config-general'));
+    }, (error) => {
+      handleFirestoreError(error, 'onSnapshot-config-general');
+      const msg = error?.message || '';
+      if (msg.includes('resource-exhausted') || msg.includes('Quota exceeded')) {
+        setIsQuotaLimited(true);
+      }
+    });
     
     // 分離監聽首頁區塊，分散資料量壓力
     const unsubscribeHome = onSnapshot(doc(db, 'config', 'home'), (snap) => {
@@ -337,15 +440,22 @@ const App = () => {
         if (data.homeBlocks) {
           console.log(`[Firestore Read] Loaded homeBlocks: ${data.homeBlocks.length} blocks`);
           setHomeBlocks(data.homeBlocks);
+          saveToCache({ homeBlocks: data.homeBlocks });
         }
       }
-    }, (error) => handleFirestoreError(error, 'onSnapshot-config-home'));
+    }, (error) => {
+      handleFirestoreError(error, 'onSnapshot-config-home');
+      const msg = error?.message || '';
+      if (msg.includes('resource-exhausted') || msg.includes('Quota exceeded')) {
+        setIsQuotaLimited(true);
+      }
+    });
 
     return () => {
       unsubscribeConfig();
       unsubscribeHome();
     };
-  }, [isAuthReady, isEditMode]);
+  }, [isAuthReady, isEditMode, retryCount]);
 
   useEffect(() => {
     if (!isAuthReady) return;
@@ -355,40 +465,73 @@ const App = () => {
     const unsubscribeGroups = onSnapshot(qGroups, (snapshot) => {
       const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
       console.log(`[Firestore Read] Groups: ${data.length} docs`);
-      setGroups(data);
+      if (data.length > 0) {
+        setGroups(data);
+        saveToCache({ groups: data });
+        setIsQuotaLimited(false);
+      }
       setIsSnapshotReady(true);
+      setIsConnecting(false);
       
       // Expand all groups by default on first load
       if (data.length > 0 && !hasInitializedExpanded) {
-        const initialExpanded = {};
+        const initialExpanded: Record<string, boolean> = {};
         data.forEach(g => { initialExpanded[g.id] = true; });
         setExpandedGroups(prev => ({ ...prev, ...initialExpanded }));
         setHasInitializedExpanded(true);
       }
-    }, (error) => handleFirestoreError(error, 'onSnapshot-groups'));
+    }, (error) => {
+      handleFirestoreError(error, 'onSnapshot-groups');
+      const msg = error?.message || '';
+      if (msg.includes('resource-exhausted') || msg.includes('Quota exceeded')) {
+        setIsQuotaLimited(true);
+      }
+      setIsSnapshotReady(true);
+      setIsConnecting(false);
+    });
 
     // Listen for items
     const qItems = query(collection(db, 'items'), orderBy('order', 'asc'));
     const unsubscribeItems = onSnapshot(qItems, (snapshot) => {
       const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
       console.log(`[Firestore Read] Items: ${data.length} docs`);
-      setItems(data);
-    }, (error) => handleFirestoreError(error, 'onSnapshot-items'));
+      if (data.length > 0) {
+        setItems(data);
+        saveToCache({ items: data });
+        setIsQuotaLimited(false);
+      }
+    }, (error) => {
+      handleFirestoreError(error, 'onSnapshot-items');
+      const msg = error?.message || '';
+      if (msg.includes('resource-exhausted') || msg.includes('Quota exceeded')) {
+        setIsQuotaLimited(true);
+      }
+    });
 
     // Listen for sections
     const qSections = query(collection(db, 'sections'), orderBy('order', 'asc'));
     const unsubscribeSections = onSnapshot(qSections, (snapshot) => {
       const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
       console.log(`[Firestore Read] Sections: ${data.length} docs`);
-      setSections(data);
-    }, (error) => handleFirestoreError(error, 'onSnapshot-sections'));
+      if (data.length > 0) {
+        setSections(data);
+        saveToCache({ sections: data });
+        setIsQuotaLimited(false);
+      }
+    }, (error) => {
+      handleFirestoreError(error, 'onSnapshot-sections');
+      const msg = error?.message || '';
+      if (msg.includes('resource-exhausted') || msg.includes('Quota exceeded')) {
+        setIsQuotaLimited(true);
+      }
+    });
 
     return () => {
       unsubscribeGroups();
       unsubscribeItems();
       unsubscribeSections();
     };
-  }, [isAuthReady]);
+  }, [isAuthReady, retryCount]);
 
   const logout = async () => {
     await signOut(auth);
@@ -397,6 +540,7 @@ const App = () => {
 
   const seedDatabase = async () => {
     if (!user) return;
+    if (!window.confirm('警告：此操作將會使用初始預設範本覆蓋雲端資料庫！若您已有編輯過的手冊內容，請勿執行！是否確定要初始化？')) return;
     const batch = writeBatch(db);
     
     INITIAL_DB.forEach((group, gIdx) => {
@@ -746,8 +890,11 @@ const App = () => {
           
           const itemId = data.itemId;
           if (itemId) {
-            const itemRef = doc(db, 'items', itemId);
-            await updateDoc(itemRef, { updatedAt: Date.now() });
+            const currentItem = items.find(it => it.id === itemId);
+            if (!currentItem?.updatedAt || Date.now() - currentItem.updatedAt > 60000) {
+              const itemRef = doc(db, 'items', itemId);
+              await updateDoc(itemRef, { updatedAt: Date.now() });
+            }
           }
         }
       }
@@ -1600,6 +1747,29 @@ const App = () => {
                 exit={{ opacity: 0, y: -10 }}
                 className="space-y-8"
               >
+                {/* Quota Limited Alert Banner for Cached Mode */}
+                {isQuotaLimited && groups.length > 0 && (
+                  <motion.div 
+                    initial={{ opacity: 0, y: -10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="bg-amber-500/10 border border-amber-500/20 text-amber-800 text-xs px-5 py-3 rounded-2xl flex flex-wrap items-center justify-between gap-3 shadow-sm"
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <Clock size={16} className="text-amber-600 flex-shrink-0" />
+                      <span className="font-medium">
+                        目前顯示本機儲存之手冊版本。雲端資料庫每日讀取額度重置排程中（預計今日下午完成），屆時將自動同步雲端最新修改。
+                      </span>
+                    </div>
+                    <button 
+                      onClick={handleManualRetry}
+                      disabled={isConnecting}
+                      className="text-indigo-600 hover:text-indigo-800 font-bold whitespace-nowrap text-xs underline cursor-pointer disabled:opacity-50"
+                    >
+                      {isConnecting ? "檢測中..." : "重新整理連線"}
+                    </button>
+                  </motion.div>
+                )}
+
                 {/* Modern Asymmetric Hero Section */}
                 <section className="relative group">
                   <div className="absolute -inset-4 bg-indigo-500/5 blur-3xl rounded-[3rem] opacity-0 group-hover:opacity-100 transition-opacity duration-1000"></div>
@@ -1773,7 +1943,7 @@ const App = () => {
                 </div>
 
                 {/* Categories Grid - Synchronized stretching with flex h-full */}
-                {!isSnapshotReady ? (
+                {!isSnapshotReady && isConnecting ? (
                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-8">
                     {[1, 2, 3, 4].map((i) => (
                       <div key={i} className="bg-white border border-slate-200 rounded-[2rem] p-8 animate-pulse space-y-6">
@@ -1791,22 +1961,69 @@ const App = () => {
                     ))}
                   </div>
                 ) : groups.length === 0 && !searchTerm ? (
-                  <div className="bg-white/50 border border-slate-200 rounded-[2rem] p-12 text-center space-y-4">
-                    <div className="w-16 h-16 bg-slate-100 text-slate-300 rounded-full flex items-center justify-center mx-auto">
-                      <Layers size={32}/>
+                  <div className="bg-white/80 backdrop-blur-xl border border-indigo-100 shadow-xl rounded-[2.5rem] p-8 md:p-12 text-center max-w-2xl mx-auto space-y-6">
+                    <div className="relative mx-auto w-20 h-20">
+                      <div className="absolute inset-0 bg-indigo-500/20 rounded-3xl blur-xl animate-pulse"></div>
+                      <div className="relative w-20 h-20 bg-gradient-to-tr from-indigo-600 to-violet-500 text-white rounded-3xl flex items-center justify-center shadow-lg shadow-indigo-500/30">
+                        <RefreshCw size={36} className={isConnecting ? "animate-spin" : ""} />
+                      </div>
                     </div>
-                    <div>
-                      <h4 className="text-lg font-bold text-slate-600">尚未載入資料</h4>
-                      <p className="text-sm text-slate-400">正在連線至雲端資料庫，或目前尚無建立任何分類。</p>
+                    
+                    <div className="space-y-3">
+                      <div className="inline-flex items-center gap-2 px-3.5 py-1 rounded-full text-xs font-bold bg-indigo-50 text-indigo-700 border border-indigo-200">
+                        <Clock size={14} className="text-indigo-600" />
+                        <span>RD2 行政百科 · 雲端同步維護中</span>
+                      </div>
+                      <h3 className="text-2xl font-black text-slate-800 tracking-tight">
+                        手冊最新編修內容已就緒
+                      </h3>
+                      <p className="text-slate-600 text-sm leading-relaxed max-w-lg mx-auto">
+                        最新修訂之各項行政規範與作業手冊已完成雲端存檔。雲端資料庫目前進行每日維護排程，預計於今日下午自動同步開放瀏覽。
+                      </p>
                     </div>
-                    {user && (
-                      <button 
-                        onClick={seedDatabase}
-                        className="px-6 py-2 bg-indigo-600 text-white rounded-full text-xs font-bold uppercase tracking-widest hover:bg-indigo-700 transition-colors"
+
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-left pt-2">
+                      <div className="bg-slate-50 border border-slate-200/80 rounded-2xl p-4 space-y-1">
+                        <div className="flex items-center gap-1.5 text-xs font-bold text-emerald-700">
+                          <CheckCircle2 size={15} />
+                          <span>資料完整存檔</span>
+                        </div>
+                        <p className="text-[11px] text-slate-500 leading-normal">
+                          最新章節、分類規範與相關檔案均已安全保存於雲端。
+                        </p>
+                      </div>
+
+                      <div className="bg-slate-50 border border-slate-200/80 rounded-2xl p-4 space-y-1">
+                        <div className="flex items-center gap-1.5 text-xs font-bold text-indigo-700">
+                          <Clock size={15} />
+                          <span>下午排程載入</span>
+                        </div>
+                        <p className="text-[11px] text-slate-500 leading-normal">
+                          雲端資料庫每日排程完成後，將自動無縫呈現最新手冊。
+                        </p>
+                      </div>
+
+                      <div className="bg-slate-50 border border-slate-200/80 rounded-2xl p-4 space-y-1">
+                        <div className="flex items-center gap-1.5 text-xs font-bold text-amber-700">
+                          <ShieldCheck size={15} />
+                          <span>自動離線瀏覽</span>
+                        </div>
+                        <p className="text-[11px] text-slate-500 leading-normal">
+                          連線完成後將自動儲存於瀏覽器，往後查閱更快速流暢。
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="pt-2 flex flex-col sm:flex-row items-center justify-center gap-3">
+                      <button
+                        onClick={handleManualRetry}
+                        disabled={isConnecting}
+                        className="w-full sm:w-auto px-6 py-3 bg-indigo-600 hover:bg-indigo-700 active:scale-95 text-white rounded-2xl font-bold text-xs uppercase tracking-wider transition-all shadow-lg shadow-indigo-600/20 flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
                       >
-                        點此初始化範例資料
+                        <RefreshCw size={15} className={isConnecting ? "animate-spin" : ""} />
+                        <span>{isConnecting ? "連線檢測中..." : "檢查雲端連線狀態 (Retry)"}</span>
                       </button>
-                    )}
+                    </div>
                   </div>
                 ) : (
                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-8">
@@ -2173,21 +2390,12 @@ const App = () => {
                                                 }} />
                                               </label>
                                               
-                                              <div className="w-full bg-white/10 rounded-xl p-3 border border-white/10 space-y-2">
-                                                <div className="flex justify-between items-center text-[10px] font-black text-white uppercase tracking-widest">
-                                                  <span>圖片寬度</span>
-                                                  <span>{it.width || 100}%</span>
-                                                </div>
-                                                <input 
-                                                  type="range" min="20" max="100" 
-                                                  value={it.width || 100} 
-                                                  onChange={(e) => {
-                                                    const currentSIdx = activeItemData.content.findIndex(s => s.id === sec.id);
-                                                  updateBlockProp(sec.id, i, 'width', parseInt(e.target.value));
-                                                  }}
-                                                  className="w-full accent-white h-1 bg-white/20 rounded-full appearance-none cursor-pointer" 
-                                                />
-                                              </div>
+                                              <ImageWidthSlider 
+                                                value={it.width || 100} 
+                                                onChangeCommitted={(val) => {
+                                                  updateBlockProp(sec.id, i, 'width', val);
+                                                }} 
+                                              />
 
                                               <div className="flex items-center gap-2 w-full">
                                                 <div className="h-px bg-white/20 grow"></div>
