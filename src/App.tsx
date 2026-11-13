@@ -11,7 +11,7 @@ import {
 } from 'lucide-react';
 import { INITIAL_DB, iconMap } from './constants';
 import { GoogleGenAI, Type } from "@google/genai";
-import { db, auth, googleProvider, signInWithPopup, onAuthStateChanged, signOut } from './firebase';
+import { db, auth, googleProvider, firebaseConfig, signInWithPopup, onAuthStateChanged, signOut } from './firebase';
 import { 
   collection, 
   onSnapshot, 
@@ -25,6 +25,63 @@ import {
   orderBy,
   writeBatch
 } from 'firebase/firestore';
+
+const parseFirestoreRestValue = (v: any): any => {
+  if (!v || typeof v !== 'object') return null;
+  if ('stringValue' in v) return v.stringValue;
+  if ('integerValue' in v) return Number(v.integerValue);
+  if ('doubleValue' in v) return Number(v.doubleValue);
+  if ('booleanValue' in v) return Boolean(v.booleanValue);
+  if ('nullValue' in v) return null;
+  if ('timestampValue' in v) return v.timestampValue;
+  if ('arrayValue' in v) return (v.arrayValue?.values || []).map(parseFirestoreRestValue);
+  if ('mapValue' in v) return parseFirestoreRestFields(v.mapValue?.fields || {});
+  return null;
+};
+
+const parseFirestoreRestFields = (fields: Record<string, any> = {}): Record<string, any> => {
+  const out: Record<string, any> = {};
+  for (const [k, v] of Object.entries(fields)) {
+    out[k] = parseFirestoreRestValue(v);
+  }
+  return out;
+};
+
+const fetchFirestoreCollectionViaRest = async (collectionId: string, signal?: AbortSignal) => {
+  const base = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents`;
+  const res = await fetch(`${base}:runQuery?key=${firebaseConfig.apiKey}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      structuredQuery: {
+        from: [{ collectionId }],
+        orderBy: [{ field: { fieldPath: 'order' }, direction: 'ASCENDING' }]
+      }
+    }),
+    signal
+  });
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    const err = new Error(`REST ${collectionId} HTTP ${res.status}: ${errText}`);
+    (err as any).status = res.status;
+    throw err;
+  }
+  const rows = await res.json();
+  return (Array.isArray(rows) ? rows : [])
+    .filter((x: any) => x?.document)
+    .map((x: any) => ({
+      id: x.document.name.split('/').pop(),
+      ...parseFirestoreRestFields(x.document.fields)
+    }));
+};
+
+const fetchFirestoreDocViaRest = async (docPath: string, signal?: AbortSignal) => {
+  const base = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents`;
+  const res = await fetch(`${base}/${docPath}?key=${firebaseConfig.apiKey}`, { signal });
+  if (!res.ok) return null;
+  const docJson = await res.json();
+  return docJson?.fields ? parseFirestoreRestFields(docJson.fields) : null;
+};
 
 
 // ImageWidthSlider component to prevent Firestore write spamming while dragging
@@ -259,9 +316,36 @@ const IconPicker = ({ currentIcon, onChange, size = 18 }: { currentIcon: string,
 };
 
 const CACHE_KEY = 'rd2_encyclopedia_cache_v2';
+const CACHE_PREFIX = 'rd2_encyclopedia_v3_';
+
+const readCachePart = (key: string) => {
+  try {
+    const raw = localStorage.getItem(`${CACHE_PREFIX}${key}`);
+    if (raw) return JSON.parse(raw);
+  } catch (e) {
+    // ignore
+  }
+  return null;
+};
 
 const getInitialCache = () => {
   try {
+    const v3Groups = readCachePart('groups');
+    if (Array.isArray(v3Groups) && v3Groups.length > 0) {
+      const v3Items = readCachePart('items');
+      const v3Sections = readCachePart('sections');
+      const v3HomeBlocks = readCachePart('homeBlocks');
+      const v3Config = readCachePart('config');
+      return {
+        groups: v3Groups,
+        items: Array.isArray(v3Items) ? v3Items : [],
+        sections: Array.isArray(v3Sections) ? v3Sections : [],
+        homeBlocks: Array.isArray(v3HomeBlocks) ? v3HomeBlocks : [],
+        config: v3Config || null,
+        hasCachedData: true
+      };
+    }
+
     const raw = localStorage.getItem(CACHE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
@@ -290,15 +374,14 @@ const getInitialCache = () => {
   };
 };
 
-const saveToCache = (partial: any) => {
-  try {
-    const raw = localStorage.getItem(CACHE_KEY);
-    const existing = raw ? JSON.parse(raw) : {};
-    const updated = { ...existing, ...partial, lastUpdated: Date.now() };
-    localStorage.setItem(CACHE_KEY, JSON.stringify(updated));
-  } catch (e) {
-    console.warn('Failed to update local cache:', e);
-  }
+const saveToCache = (partial: Record<string, any>) => {
+  Object.entries(partial).forEach(([key, value]) => {
+    try {
+      localStorage.setItem(`${CACHE_PREFIX}${key}`, JSON.stringify(value));
+    } catch (e) {
+      console.warn(`Failed to cache ${key} in localStorage:`, e);
+    }
+  });
 };
 
 const initialCached = getInitialCache();
@@ -312,8 +395,10 @@ const App = () => {
   const [user, setUser] = useState(null);
   const [isSnapshotReady, setIsSnapshotReady] = useState(initialCached.hasCachedData);
   const [isQuotaLimited, setIsQuotaLimited] = useState(false);
-  const [isConnecting, setIsConnecting] = useState(false);
+  const [connectionErrorType, setConnectionErrorType] = useState<'none' | 'quota' | 'network'>('none');
+  const [isConnecting, setIsConnecting] = useState(!initialCached.hasCachedData);
   const [retryCount, setRetryCount] = useState(0);
+  const groupsLoadedRef = useRef(initialCached.groups.length > 0);
   
   const dbData = useMemo(() => {
     return groups.map(g => ({
@@ -367,7 +452,7 @@ const App = () => {
     initialCached.groups.forEach((g: any) => { initialExpanded[g.id] = true; });
     return initialExpanded;
   });
-  const [hasInitializedExpanded, setHasInitializedExpanded] = useState(true);
+  const [hasInitializedExpanded, setHasInitializedExpanded] = useState(() => initialCached.groups.length > 0);
   const [headerTitle, setHeaderTitle] = useState(initialCached.config?.headerTitle || 'RD2 行政百科');
   const [headerSubtitle, setHeaderSubtitle] = useState(initialCached.config?.headerSubtitle || 'Executive Encyclopedia');
   const [headerDescription, setHeaderDescription] = useState(initialCached.config?.headerDescription || '一站式行政資源，精準搜尋，快速導航。');
@@ -387,13 +472,29 @@ const App = () => {
   const [aiTargetGroupId, setAiTargetGroupId] = useState(null);
   const [showFontControls, setShowFontControls] = useState(false);
 
+  const applyConfigData = useCallback((data: any) => {
+    if (!data) return;
+    if (data.headerTitle) setHeaderTitle(data.headerTitle);
+    if (data.headerSubtitle) setHeaderSubtitle(data.headerSubtitle);
+    if (data.headerDescription) setHeaderDescription(data.headerDescription);
+    if (data.footerTaxLabel) setFooterTaxLabel(data.footerTaxLabel);
+    if (data.footerTaxId) setFooterTaxId(data.footerTaxId);
+    if (data.footerCopyright) setFooterCopyright(data.footerCopyright);
+    if (data.footerScrollText) setFooterScrollText(data.footerScrollText);
+    if (data.detailTitleFontSize) setDetailTitleFontSize(data.detailTitleFontSize);
+    if (data.groupFontSize) setGroupFontSize(data.groupFontSize);
+    if (data.itemFontSize) setItemFontSize(data.itemFontSize);
+    if (data.sectionFontSize) setSectionFontSize(data.sectionFontSize);
+    if (data.contentFontSize) setContentFontSize(data.contentFontSize);
+    if (data.linkFontSize) setLinkFontSize(data.linkFontSize);
+    saveToCache({ config: data });
+  }, []);
+
   // --- Auth & Data Fetching ---
   const handleManualRetry = () => {
     setIsConnecting(true);
+    setConnectionErrorType('none');
     setRetryCount(prev => prev + 1);
-    setTimeout(() => {
-      setIsConnecting(false);
-    }, 2500);
   };
 
   useEffect(() => {
@@ -405,31 +506,16 @@ const App = () => {
   }, []);
 
   useEffect(() => {
-    if (!isAuthReady) return;
-    
     const unsubscribeConfig = onSnapshot(doc(db, 'config', 'general'), (snap) => {
       if (snap.exists() && !isEditMode) {
-        const data = snap.data();
-        if (data.headerTitle) setHeaderTitle(data.headerTitle);
-        if (data.headerSubtitle) setHeaderSubtitle(data.headerSubtitle);
-        if (data.headerDescription) setHeaderDescription(data.headerDescription);
-        if (data.footerTaxLabel) setFooterTaxLabel(data.footerTaxLabel);
-        if (data.footerTaxId) setFooterTaxId(data.footerTaxId);
-        if (data.footerCopyright) setFooterCopyright(data.footerCopyright);
-        if (data.footerScrollText) setFooterScrollText(data.footerScrollText);
-        if (data.detailTitleFontSize) setDetailTitleFontSize(data.detailTitleFontSize);
-        if (data.groupFontSize) setGroupFontSize(data.groupFontSize);
-        if (data.itemFontSize) setItemFontSize(data.itemFontSize);
-        if (data.sectionFontSize) setSectionFontSize(data.sectionFontSize);
-        if (data.contentFontSize) setContentFontSize(data.contentFontSize);
-        if (data.linkFontSize) setLinkFontSize(data.linkFontSize);
-        saveToCache({ config: data });
+        applyConfigData(snap.data());
       }
     }, (error) => {
       handleFirestoreError(error, 'onSnapshot-config-general');
       const msg = error?.message || '';
       if (msg.includes('resource-exhausted') || msg.includes('Quota exceeded')) {
         setIsQuotaLimited(true);
+        setConnectionErrorType('quota');
       }
     });
     
@@ -448,6 +534,7 @@ const App = () => {
       const msg = error?.message || '';
       if (msg.includes('resource-exhausted') || msg.includes('Quota exceeded')) {
         setIsQuotaLimited(true);
+        setConnectionErrorType('quota');
       }
     });
 
@@ -455,10 +542,83 @@ const App = () => {
       unsubscribeConfig();
       unsubscribeHome();
     };
-  }, [isAuthReady, isEditMode, retryCount]);
+  }, [isEditMode, retryCount, applyConfigData]);
 
   useEffect(() => {
-    if (!isAuthReady) return;
+    let isMounted = true;
+    let fallbackTriggered = false;
+    const abortController = new AbortController();
+
+    const isQuotaMsg = (err: any) => {
+      const msg = String(err?.message || '') + ' ' + String(err?.code || '');
+      return msg.includes('resource-exhausted') || msg.includes('Quota exceeded') || msg.includes('RESOURCE_EXHAUSTED') || err?.status === 429;
+    };
+
+    const runRestFallback = async (reason: string) => {
+      if (!isMounted || fallbackTriggered) return;
+      fallbackTriggered = true;
+      console.log(`[Firestore Fallback] Triggering HTTPS REST fallback (${reason})...`);
+      try {
+        const [restGroups, restItems, restSections, restConfig, restHome] = await Promise.all([
+          fetchFirestoreCollectionViaRest('groups', abortController.signal),
+          fetchFirestoreCollectionViaRest('items', abortController.signal),
+          fetchFirestoreCollectionViaRest('sections', abortController.signal),
+          fetchFirestoreDocViaRest('config/general', abortController.signal),
+          fetchFirestoreDocViaRest('config/home', abortController.signal),
+        ]);
+        if (!isMounted) return;
+        if (restGroups.length > 0) {
+          groupsLoadedRef.current = true;
+          setGroups(restGroups);
+          saveToCache({ groups: restGroups });
+          setExpandedGroups(prev => {
+            if (Object.keys(prev).length > 0) return prev;
+            const initialExpanded: Record<string, boolean> = {};
+            restGroups.forEach((g: any) => { initialExpanded[g.id] = true; });
+            return initialExpanded;
+          });
+          setHasInitializedExpanded(true);
+        }
+        if (restItems.length > 0) {
+          setItems(restItems);
+          saveToCache({ items: restItems });
+        }
+        if (restSections.length > 0) {
+          setSections(restSections);
+          saveToCache({ sections: restSections });
+        }
+        if (restConfig) applyConfigData(restConfig);
+        if (restHome?.homeBlocks) {
+          setHomeBlocks(restHome.homeBlocks);
+          saveToCache({ homeBlocks: restHome.homeBlocks });
+        }
+        setIsQuotaLimited(false);
+        setConnectionErrorType('none');
+      } catch (restErr: any) {
+        if (!isMounted || restErr?.name === 'AbortError') return;
+        console.warn('[Firestore Fallback] REST fallback failed:', restErr);
+        if (isQuotaMsg(restErr)) {
+          setIsQuotaLimited(true);
+          setConnectionErrorType('quota');
+        } else if (!groupsLoadedRef.current) {
+          setConnectionErrorType('network');
+        }
+      } finally {
+        if (isMounted) {
+          setIsSnapshotReady(true);
+          setIsConnecting(false);
+        }
+      }
+    };
+
+    // If onSnapshot hasn't delivered groups within 4.5s (e.g., corporate proxy blocking WebChannel), trigger REST fallback
+    const fallbackTimer = setTimeout(() => {
+      if (!groupsLoadedRef.current) {
+        runRestFallback('timeout-4.5s');
+      } else {
+        setIsConnecting(false);
+      }
+    }, 4500);
 
     // Listen for groups
     const qGroups = query(collection(db, 'groups'), orderBy('order', 'asc'));
@@ -466,12 +626,15 @@ const App = () => {
       const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
       console.log(`[Firestore Read] Groups: ${data.length} docs`);
       if (data.length > 0) {
+        groupsLoadedRef.current = true;
         setGroups(data);
         saveToCache({ groups: data });
         setIsQuotaLimited(false);
+        setConnectionErrorType('none');
       }
       setIsSnapshotReady(true);
       setIsConnecting(false);
+      clearTimeout(fallbackTimer);
       
       // Expand all groups by default on first load
       if (data.length > 0 && !hasInitializedExpanded) {
@@ -482,12 +645,16 @@ const App = () => {
       }
     }, (error) => {
       handleFirestoreError(error, 'onSnapshot-groups');
-      const msg = error?.message || '';
-      if (msg.includes('resource-exhausted') || msg.includes('Quota exceeded')) {
+      if (isQuotaMsg(error)) {
         setIsQuotaLimited(true);
+        setConnectionErrorType('quota');
+        setIsSnapshotReady(true);
+        setIsConnecting(false);
+        clearTimeout(fallbackTimer);
+      } else {
+        // Non-quota error (e.g., WebChannel blocked by corporate firewall) -> immediately try REST fallback
+        runRestFallback(`onSnapshot-error:${error?.code || 'unknown'}`);
       }
-      setIsSnapshotReady(true);
-      setIsConnecting(false);
     });
 
     // Listen for items
@@ -502,9 +669,9 @@ const App = () => {
       }
     }, (error) => {
       handleFirestoreError(error, 'onSnapshot-items');
-      const msg = error?.message || '';
-      if (msg.includes('resource-exhausted') || msg.includes('Quota exceeded')) {
+      if (isQuotaMsg(error)) {
         setIsQuotaLimited(true);
+        setConnectionErrorType('quota');
       }
     });
 
@@ -520,18 +687,21 @@ const App = () => {
       }
     }, (error) => {
       handleFirestoreError(error, 'onSnapshot-sections');
-      const msg = error?.message || '';
-      if (msg.includes('resource-exhausted') || msg.includes('Quota exceeded')) {
+      if (isQuotaMsg(error)) {
         setIsQuotaLimited(true);
+        setConnectionErrorType('quota');
       }
     });
 
     return () => {
+      isMounted = false;
+      clearTimeout(fallbackTimer);
+      abortController.abort();
       unsubscribeGroups();
       unsubscribeItems();
       unsubscribeSections();
     };
-  }, [isAuthReady, retryCount]);
+  }, [retryCount, applyConfigData]);
 
   const logout = async () => {
     await signOut(auth);
@@ -1943,7 +2113,7 @@ const App = () => {
                 </div>
 
                 {/* Categories Grid - Synchronized stretching with flex h-full */}
-                {!isSnapshotReady && isConnecting ? (
+                {isConnecting && groups.length === 0 ? (
                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-8">
                     {[1, 2, 3, 4].map((i) => (
                       <div key={i} className="bg-white border border-slate-200 rounded-[2rem] p-8 animate-pulse space-y-6">
@@ -1961,70 +2131,137 @@ const App = () => {
                     ))}
                   </div>
                 ) : groups.length === 0 && !searchTerm ? (
-                  <div className="bg-white/80 backdrop-blur-xl border border-indigo-100 shadow-xl rounded-[2.5rem] p-8 md:p-12 text-center max-w-2xl mx-auto space-y-6">
-                    <div className="relative mx-auto w-20 h-20">
-                      <div className="absolute inset-0 bg-indigo-500/20 rounded-3xl blur-xl animate-pulse"></div>
-                      <div className="relative w-20 h-20 bg-gradient-to-tr from-indigo-600 to-violet-500 text-white rounded-3xl flex items-center justify-center shadow-lg shadow-indigo-500/30">
-                        <RefreshCw size={36} className={isConnecting ? "animate-spin" : ""} />
-                      </div>
-                    </div>
-                    
-                    <div className="space-y-3">
-                      <div className="inline-flex items-center gap-2 px-3.5 py-1 rounded-full text-xs font-bold bg-indigo-50 text-indigo-700 border border-indigo-200">
-                        <Clock size={14} className="text-indigo-600" />
-                        <span>RD2 行政百科 · 雲端同步維護中</span>
-                      </div>
-                      <h3 className="text-2xl font-black text-slate-800 tracking-tight">
-                        手冊最新編修內容已就緒
-                      </h3>
-                      <p className="text-slate-600 text-sm leading-relaxed max-w-lg mx-auto">
-                        最新修訂之各項行政規範與作業手冊已完成雲端存檔。雲端資料庫目前進行每日維護排程，預計於今日下午自動同步開放瀏覽。
-                      </p>
-                    </div>
-
-                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-left pt-2">
-                      <div className="bg-slate-50 border border-slate-200/80 rounded-2xl p-4 space-y-1">
-                        <div className="flex items-center gap-1.5 text-xs font-bold text-emerald-700">
-                          <CheckCircle2 size={15} />
-                          <span>資料完整存檔</span>
+                  connectionErrorType === 'quota' ? (
+                    <div className="bg-white/80 backdrop-blur-xl border border-indigo-100 shadow-xl rounded-[2.5rem] p-8 md:p-12 text-center max-w-2xl mx-auto space-y-6">
+                      <div className="relative mx-auto w-20 h-20">
+                        <div className="absolute inset-0 bg-indigo-500/20 rounded-3xl blur-xl animate-pulse"></div>
+                        <div className="relative w-20 h-20 bg-gradient-to-tr from-indigo-600 to-violet-500 text-white rounded-3xl flex items-center justify-center shadow-lg shadow-indigo-500/30">
+                          <RefreshCw size={36} className={isConnecting ? "animate-spin" : ""} />
                         </div>
-                        <p className="text-[11px] text-slate-500 leading-normal">
-                          最新章節、分類規範與相關檔案均已安全保存於雲端。
+                      </div>
+                      
+                      <div className="space-y-3">
+                        <div className="inline-flex items-center gap-2 px-3.5 py-1 rounded-full text-xs font-bold bg-indigo-50 text-indigo-700 border border-indigo-200">
+                          <Clock size={14} className="text-indigo-600" />
+                          <span>RD2 行政百科 · 雲端同步維護中</span>
+                        </div>
+                        <h3 className="text-2xl font-black text-slate-800 tracking-tight">
+                          手冊最新編修內容已就緒
+                        </h3>
+                        <p className="text-slate-600 text-sm leading-relaxed max-w-lg mx-auto">
+                          最新修訂之各項行政規範與作業手冊已完成雲端存檔。雲端資料庫目前進行每日維護排程，預計於今日下午自動同步開放瀏覽。
                         </p>
                       </div>
 
-                      <div className="bg-slate-50 border border-slate-200/80 rounded-2xl p-4 space-y-1">
-                        <div className="flex items-center gap-1.5 text-xs font-bold text-indigo-700">
-                          <Clock size={15} />
-                          <span>下午排程載入</span>
+                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-left pt-2">
+                        <div className="bg-slate-50 border border-slate-200/80 rounded-2xl p-4 space-y-1">
+                          <div className="flex items-center gap-1.5 text-xs font-bold text-emerald-700">
+                            <CheckCircle2 size={15} />
+                            <span>資料完整存檔</span>
+                          </div>
+                          <p className="text-[11px] text-slate-500 leading-normal">
+                            最新章節、分類規範與相關檔案均已安全保存於雲端。
+                          </p>
                         </div>
-                        <p className="text-[11px] text-slate-500 leading-normal">
-                          雲端資料庫每日排程完成後，將自動無縫呈現最新手冊。
+
+                        <div className="bg-slate-50 border border-slate-200/80 rounded-2xl p-4 space-y-1">
+                          <div className="flex items-center gap-1.5 text-xs font-bold text-indigo-700">
+                            <Clock size={15} />
+                            <span>下午排程載入</span>
+                          </div>
+                          <p className="text-[11px] text-slate-500 leading-normal">
+                            雲端資料庫每日排程完成後，將自動無縫呈現最新手冊。
+                          </p>
+                        </div>
+
+                        <div className="bg-slate-50 border border-slate-200/80 rounded-2xl p-4 space-y-1">
+                          <div className="flex items-center gap-1.5 text-xs font-bold text-amber-700">
+                            <ShieldCheck size={15} />
+                            <span>自動離線瀏覽</span>
+                          </div>
+                          <p className="text-[11px] text-slate-500 leading-normal">
+                            連線完成後將自動儲存於瀏覽器，往後查閱更快速流暢。
+                          </p>
+                        </div>
+                      </div>
+
+                      <div className="pt-2 flex flex-col sm:flex-row items-center justify-center gap-3">
+                        <button
+                          onClick={handleManualRetry}
+                          disabled={isConnecting}
+                          className="w-full sm:w-auto px-6 py-3 bg-indigo-600 hover:bg-indigo-700 active:scale-95 text-white rounded-2xl font-bold text-xs uppercase tracking-wider transition-all shadow-lg shadow-indigo-600/20 flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+                        >
+                          <RefreshCw size={15} className={isConnecting ? "animate-spin" : ""} />
+                          <span>{isConnecting ? "連線檢測中..." : "檢查雲端連線狀態 (Retry)"}</span>
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="bg-white/80 backdrop-blur-xl border border-amber-200 shadow-xl rounded-[2.5rem] p-8 md:p-12 text-center max-w-2xl mx-auto space-y-6">
+                      <div className="relative mx-auto w-20 h-20">
+                        <div className="absolute inset-0 bg-amber-500/20 rounded-3xl blur-xl"></div>
+                        <div className="relative w-20 h-20 bg-gradient-to-tr from-amber-500 to-orange-500 text-white rounded-3xl flex items-center justify-center shadow-lg shadow-amber-500/30">
+                          <AlertCircle size={36} />
+                        </div>
+                      </div>
+                      
+                      <div className="space-y-3">
+                        <div className="inline-flex items-center gap-2 px-3.5 py-1 rounded-full text-xs font-bold bg-amber-50 text-amber-700 border border-amber-200">
+                          <AlertCircle size={14} className="text-amber-600" />
+                          <span>雲端資料連線逾時或網路受限</span>
+                        </div>
+                        <h3 className="text-2xl font-black text-slate-800 tracking-tight">
+                          目前無法從您的瀏覽器讀取雲端資料
+                        </h3>
+                        <p className="text-slate-600 text-sm leading-relaxed max-w-lg mx-auto">
+                          系統偵測到您的網路環境或瀏覽器擴充功能可能暫時阻擋了 Google Firebase 連線，請嘗試點擊下方按鈕重新連線。
                         </p>
                       </div>
 
-                      <div className="bg-slate-50 border border-slate-200/80 rounded-2xl p-4 space-y-1">
-                        <div className="flex items-center gap-1.5 text-xs font-bold text-amber-700">
-                          <ShieldCheck size={15} />
-                          <span>自動離線瀏覽</span>
+                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-left pt-2">
+                        <div className="bg-slate-50 border border-slate-200/80 rounded-2xl p-4 space-y-1">
+                          <div className="flex items-center gap-1.5 text-xs font-bold text-indigo-700">
+                            <RefreshCw size={15} />
+                            <span>1. 重新連線嘗試</span>
+                          </div>
+                          <p className="text-[11px] text-slate-500 leading-normal">
+                            點擊下方按鈕或按 Ctrl+F5 強制重新整理頁面。
+                          </p>
                         </div>
-                        <p className="text-[11px] text-slate-500 leading-normal">
-                          連線完成後將自動儲存於瀏覽器，往後查閱更快速流暢。
-                        </p>
+
+                        <div className="bg-slate-50 border border-slate-200/80 rounded-2xl p-4 space-y-1">
+                          <div className="flex items-center gap-1.5 text-xs font-bold text-amber-700">
+                            <ShieldCheck size={15} />
+                            <span>2. 排除擴充阻擋</span>
+                          </div>
+                          <p className="text-[11px] text-slate-500 leading-normal">
+                            若開有廣告攔截器或 VPN，請試著使用瀏覽器無痕模式開啟。
+                          </p>
+                        </div>
+
+                        <div className="bg-slate-50 border border-slate-200/80 rounded-2xl p-4 space-y-1">
+                          <div className="flex items-center gap-1.5 text-xs font-bold text-emerald-700">
+                            <CheckCircle2 size={15} />
+                            <span>3. 首次載入快取</span>
+                          </div>
+                          <p className="text-[11px] text-slate-500 leading-normal">
+                            成功載入一次後資料將保存在本機，往後即可離線秒開。
+                          </p>
+                        </div>
+                      </div>
+
+                      <div className="pt-2 flex flex-col sm:flex-row items-center justify-center gap-3">
+                        <button
+                          onClick={handleManualRetry}
+                          disabled={isConnecting}
+                          className="w-full sm:w-auto px-6 py-3 bg-indigo-600 hover:bg-indigo-700 active:scale-95 text-white rounded-2xl font-bold text-xs uppercase tracking-wider transition-all shadow-lg shadow-indigo-600/20 flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+                        >
+                          <RefreshCw size={15} className={isConnecting ? "animate-spin" : ""} />
+                          <span>{isConnecting ? "連線檢測中..." : "重新連線 (Retry)"}</span>
+                        </button>
                       </div>
                     </div>
-
-                    <div className="pt-2 flex flex-col sm:flex-row items-center justify-center gap-3">
-                      <button
-                        onClick={handleManualRetry}
-                        disabled={isConnecting}
-                        className="w-full sm:w-auto px-6 py-3 bg-indigo-600 hover:bg-indigo-700 active:scale-95 text-white rounded-2xl font-bold text-xs uppercase tracking-wider transition-all shadow-lg shadow-indigo-600/20 flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
-                      >
-                        <RefreshCw size={15} className={isConnecting ? "animate-spin" : ""} />
-                        <span>{isConnecting ? "連線檢測中..." : "檢查雲端連線狀態 (Retry)"}</span>
-                      </button>
-                    </div>
-                  </div>
+                  )
                 ) : (
                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-8">
                     {filteredMenu.map((group, gIdx) => (
